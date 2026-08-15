@@ -1,0 +1,3 @@
+[console_scripts]
+gpowake = gpowake.cli:main
+

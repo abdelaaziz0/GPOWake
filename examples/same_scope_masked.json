@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "source_dc": "dc01.corp.local",
+  "warnings": [],
+  "soms": [
+    {
+      "dn": "DC=corp,DC=local",
+      "kind": "DOMAIN",
+      "parent_dn": null,
+      "gp_link": "",
+      "gp_options": 0,
+      "security_descriptor": {"aces": []}
+    },
+    {
+      "dn": "OU=Domain Controllers,DC=corp,DC=local",
+      "kind": "OU",
+      "parent_dn": "DC=corp,DC=local",
+      "gp_link": "[LDAP://CN={BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB},CN=Policies,CN=System,DC=corp,DC=local;0][LDAP://CN={AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA},CN=Policies,CN=System,DC=corp,DC=local;0]",
+      "gp_options": 0,
+      "security_descriptor": {
+        "aces": [
+          {
+            "trustee_sid": "S-1-5-21-111-222-333-1100",
+            "ace_type": "ALLOW",
+            "access_mask": "0x00000020",
+            "object_type": "f30e3bbe-9ff0-11d1-b603-0000f80367c1"
+          }
+        ]
+      }
+    }
+  ],
+  "gpos": [
+    {
+      "dn": "CN={AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA},CN=Policies,CN=System,DC=corp,DC=local",
+      "guid": "{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}",
+      "name": "Legacy Debug Policy",
+      "flags": 0,
+      "machine_extensions": ["827d319e-6eac-11d2-a4ea-00c04f79f83a"],
+      "security_descriptor": {
+        "aces": [
+          {"trustee_sid": "S-1-5-11", "ace_type": "ALLOW", "access_mask": "0x80000000"},
+          {"trustee_sid": "S-1-5-11", "ace_type": "ALLOW", "access_mask": "0x00000100", "object_type": "edacfd8f-ffb3-11d1-b41d-00a0c968f939"}
+        ]
+      },
+      "settings": [
+        {
+          "kind": "PRIVILEGE_RIGHT",
+          "name": "SeDebugPrivilege",
+          "value": ["S-1-5-11"]
+        }
+      ]
+    },
+    {
+      "dn": "CN={BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB},CN=Policies,CN=System,DC=corp,DC=local",
+      "guid": "{BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB}",
+      "name": "Default Domain Controllers Policy",
+      "flags": 0,
+      "machine_extensions": ["827d319e-6eac-11d2-a4ea-00c04f79f83a"],
+      "security_descriptor": {
+        "aces": [
+          {"trustee_sid": "S-1-5-11", "ace_type": "ALLOW", "access_mask": "0x80000000"},
+          {"trustee_sid": "S-1-5-11", "ace_type": "ALLOW", "access_mask": "0x00000100", "object_type": "edacfd8f-ffb3-11d1-b41d-00a0c968f939"}
+        ]
+      },
+      "settings": [
+        {
+          "kind": "PRIVILEGE_RIGHT",
+          "name": "SeDebugPrivilege",
+          "value": ["S-1-5-32-544"]
+        }
+      ]
+    }
+  ],
+  "principals": [
+    {
+      "sid": "S-1-5-21-111-222-333-1100",
+      "name": "CORP\\helpdesk-ops",
+      "token_sids": ["S-1-5-11"]
+    }
+  ],
+  "targets": [
+    {
+      "dn": "CN=DC01,OU=Domain Controllers,DC=corp,DC=local",
+      "name": "DC01",
+      "sid": "S-1-5-21-111-222-333-1001",
+      "som_dn": "OU=Domain Controllers,DC=corp,DC=local",
+      "token_sids": ["S-1-5-11"],
+      "criticality": "DOMAIN_CONTROLLER"
+    },
+    {
+      "dn": "CN=DC02,OU=Domain Controllers,DC=corp,DC=local",
+      "name": "DC02",
+      "sid": "S-1-5-21-111-222-333-1002",
+      "som_dn": "OU=Domain Controllers,DC=corp,DC=local",
+      "token_sids": ["S-1-5-11"],
+      "criticality": "DOMAIN_CONTROLLER"
+    }
+  ]
+}

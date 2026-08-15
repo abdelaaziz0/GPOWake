@@ -1,0 +1,173 @@
+Metadata-Version: 2.1
+Name: gpowake
+Version: 0.1.0
+Summary: Counterfactual detector for dormant Active Directory Group Policy weaponization
+Home-page: UNKNOWN
+Author: GPOWake contributors
+License: MIT
+Platform: UNKNOWN
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: collect
+Provides-Extra: dev
+License-File: LICENSE
+
+# GPOWake
+
+GPOWake is a Linux-first detector for dormant Active Directory Group Policy weaponization. It answers a counterfactual question:
+
+> Given a dangerous setting already present in a GPO, can this principal make it effective against this computer with one or two permitted changes?
+
+It keeps activation separate from ordinary GPO-content weaponization. A finding must connect existing dangerous content, its current dormancy reason, the actor's effective permission, a minimal successful transition, and the resulting target set. GPOWake is read-only: it models transitions but never writes them to AD or SYSVOL.
+
+## Implemented milestone
+
+- Exact `gPLink` parsing, including stored order, disabled bit `0x1`, and enforced bit `0x2`.
+- Separate `gPOptions` Block Inheritance handling.
+- Site → domain → parent OU → child OU policy ordering.
+- Normal and enforced precedence, including enforced ancestors and Block Inheritance boundaries.
+- Computer-section, security-filter, WMI-result, CSE-advertisement, and GPT-readability gates.
+- Object-specific AD DACL access checks for `WriteGPLink`, `WriteGPOptions`, GPO `flags`, and `WRITE_DAC`.
+- `GptTmpl.inf` parsing for privilege rights, restricted groups, and registry-backed security options.
+- Machine `Registry.pol` parsing for deterministic single-value policies.
+- Bounded one- or two-action transition search.
+- Live LDAP/SYSVOL collection pinned to one domain controller and offline JSON snapshots.
+- Text and JSON findings with stable IDs, confidence, severity, blast radius, and every required low-level capability.
+
+The built-in danger catalog is deliberately narrow. It recognizes dangerous privilege-right assignments such as `SeDebugPrivilege`, `SeImpersonatePrivilege`, and `SeTcbPrivilege`, while excluding standard assignments to built-in Administrators and similarly privileged service identities. Snapshot settings can explicitly set `dangerous`, `severity`, and `rationale` to extend this catalog.
+
+## Install
+
+Python 3.10 or newer is required.
+
+```bash
+python3 -m pip install -e '.[collect,dev]'
+pytest
+```
+
+The core offline analyzer has no third-party runtime dependency. Live collection uses `ldap3` and `impacket` through the `collect` extra.
+
+## Quick start with the included lab
+
+```bash
+gpowake scan \
+  --snapshot examples/same_scope_masked.json \
+  --max-actions 1 \
+  --output report.json
+
+gpowake explain \
+  --finding "$(python3 -c 'import json; print(json.load(open("report.json"))["findings"][0]["finding_id"])')" \
+  --report report.json
+```
+
+Without `--output`, `scan` prints a compact text report. A `.json` output name selects JSON automatically; `--format` can override that choice.
+
+## Live collection and scan
+
+NTLM password authentication:
+
+```bash
+export GPOWAKE_PASSWORD='replace-me'
+
+gpowake scan \
+  --domain corp.local \
+  --dc-ip 10.0.0.10 \
+  --dc-host dc01.corp.local \
+  --username auditor \
+  --password-env GPOWAKE_PASSWORD \
+  --principal 'helpdesk-ops' \
+  --scope computer \
+  --max-actions 1 \
+  --save-snapshot corp-snapshot.json \
+  --output report.json
+```
+
+Kerberos uses the current cache (a DC hostname is strongly recommended so the LDAP SPN is correct):
+
+```bash
+gpowake scan \
+  --domain corp.local \
+  --dc-ip 10.0.0.10 \
+  --dc-host dc01.corp.local \
+  --kerberos \
+  --ccache /tmp/corp.ccache \
+  --principal 'CORP\\helpdesk-ops' \
+  --output report.json
+```
+
+To separate evidence collection from analysis:
+
+```bash
+gpowake collect \
+  --domain corp.local \
+  --dc-ip 10.0.0.10 \
+  --dc-host dc01.corp.local \
+  --username auditor \
+  --password-env GPOWAKE_PASSWORD \
+  --principal helpdesk-ops \
+  --output corp-snapshot.json
+
+gpowake scan --snapshot corp-snapshot.json --principal helpdesk-ops --output report.json
+```
+
+`--target-filter` accepts an LDAP filter and defaults to all computers. Use a least-privileged read-only collection identity. `--hashes LMHASH:NTHASH` is also supported for NTLM. Passing secrets with `--password` can expose them in process listings, so `--password-env` is preferred.
+
+## Transition model
+
+The solver currently tests these state changes when the actor has the exact required right:
+
+| Transition | Required capability |
+| --- | --- |
+| Add, enable, reorder, or enforce a link | `WriteGPLink` on that SOM |
+| Clear Block Inheritance | `WriteGPOptions` on that SOM |
+| Grant target Read + Apply Group Policy | `WriteGPOSecurity` (`WRITE_DAC`) on the GPO |
+| Enable the computer half | `WriteGPOContainer` (`flags` write) on the GPO |
+
+The engine recalculates the full effective setting after every proposed transition. A permission alone is not a finding, and an action that leaves another gate or winning policy in place is rejected. At depth two, commutative action orderings are deduplicated.
+
+## Snapshot format
+
+Snapshots use schema version `1`. The included [example](examples/same_scope_masked.json) is a complete reference. Important details:
+
+- `gp_link` is preserved in its native ordered string form.
+- `access_mask` accepts a JSON integer or a string such as `"0x00000020"`.
+- Object-specific ACEs use the schema/control-access GUID in `object_type`.
+- Omitting a security descriptor means “not collected,” not “allow all.”
+- `machine_extensions: null` means unknown; an empty list means the GPO explicitly advertises no machine CSE.
+- `functionality_version` records `gPCFunctionalityVersion`; live collection rejects values other than the protocol-supported value `2`.
+- A setting may be embedded under `settings`, or loaded from paths relative to the snapshot with `gpt_tmpl_files` and `registry_pol_files`.
+- Set `wmi_result` to `true` or `false` only when independently evaluated for that target population. An unknown WMI result fails closed.
+
+Parse a template independently with:
+
+```bash
+gpowake parse-gpttmpl path/to/GptTmpl.inf
+```
+
+## Scope and explicit limitations
+
+This release intentionally supports deterministic computer-side policy only. It does not claim correctness for user policy, loopback, GPP item-level targeting, scripts, software installation, arbitrary WMI evaluation, fake LDAP-hosted GPT paths, or full cross-domain links. Restricted Groups are parsed, but only identical normalized directives use last-writer semantics; richer group-membership composition remains future work.
+
+Live collection asks AD for computed `tokenGroups` and each object's DACL. If either cannot be read, relevant access checks fail closed. Site information is often dynamic; a target without `msDS-SiteName` receives a collection warning and reduced confidence where appropriate. AD and GPT versions are retained and mismatches reduce confidence.
+
+## Development
+
+```bash
+PYTHONPATH=src pytest
+python3 -m gpowake --help
+```
+
+The code is split by responsibility:
+
+```text
+collectors/ldap.py     topology, GPOs, DACLs, token groups
+collectors/sysvol.py   DC-pinned GPT collection
+parsers/               GptTmpl.inf and Registry.pol
+acl.py                 effective low-level capabilities
+precedence.py          target-specific applicability and winners
+solver.py              bounded counterfactual transitions
+snapshot.py            stable offline evidence format
+report.py              JSON and human-readable findings
+```
+
+
