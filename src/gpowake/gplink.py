@@ -19,10 +19,19 @@ def parse_gplink(value: str | None) -> tuple[Link, ...]:
     matches = list(_LINK_RE.finditer(value))
     if not matches or "".join(m.group(0) for m in matches) != value.strip():
         raise ValueError(f"malformed gPLink value: {value!r}")
-    return tuple(
-        Link(gpo_dn=match.group(1).strip(), options=int(match.group(2)), order=index)
-        for index, match in enumerate(matches, start=1)
-    )
+    links: list[Link] = []
+    for index, match in enumerate(matches, start=1):
+        options = int(match.group(2))
+        if options > 0xFFFFFFFF:
+            raise ValueError(f"gPLink options are outside uint32 range: {options}")
+        links.append(
+            Link(
+                gpo_dn=match.group(1).strip(),
+                options=options,
+                order=index,
+            )
+        )
+    return tuple(links)
 
 
 def serialize_gplink(links: tuple[Link, ...] | list[Link]) -> str:

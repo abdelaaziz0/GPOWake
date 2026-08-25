@@ -11,6 +11,7 @@ from gpowake.acl import (
 )
 from gpowake.gplink import parse_gplink, reorder_link, serialize_gplink
 from gpowake.models import (
+    AccessDecision,
     Ace,
     AceType,
     Capability,
@@ -70,7 +71,10 @@ def test_canonical_deny_wins() -> None:
             Ace(ACTOR, AceType.ALLOW, ADS_RIGHT_DS_WRITE_PROP, GPLINK_GUID),
         )
     )
-    assert not access_check(descriptor, (ACTOR,), ADS_RIGHT_DS_WRITE_PROP, GPLINK_GUID)
-    assert not access_check(
-        descriptor, (ACTOR,), ADS_RIGHT_DS_WRITE_PROP, GPOPTIONS_GUID
+    assert (
+        access_check(descriptor, (ACTOR,), ADS_RIGHT_DS_WRITE_PROP, GPLINK_GUID)
+        is AccessDecision.DENY
     )
+    assert access_check(
+        descriptor, (ACTOR,), ADS_RIGHT_DS_WRITE_PROP, GPOPTIONS_GUID
+    ) is AccessDecision.DENY

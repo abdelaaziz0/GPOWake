@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from ..catalog import REGISTRY_CSE_GUID
+from ..catalog import REGISTRY_CSE_GUID, assess_setting
 from ..models import Setting, SettingKind
 
 
@@ -26,18 +26,28 @@ def _expect(data: bytes, offset: int, token: bytes) -> int:
 def _wide_until(data: bytes, offset: int, delimiter: str) -> tuple[str, int]:
     marker = delimiter.encode("utf-16-le")
     end = data.find(marker, offset)
-    if end < 0 or (end - offset) % 2:
+    while end >= 0 and (end - offset) % 2:
+        end = data.find(marker, end + 1)
+    if end < 0:
         raise ValueError(f"malformed Registry.pol string at byte {offset}")
-    return data[offset:end].decode("utf-16-le").rstrip("\x00"), end + len(marker)
+    try:
+        value = data[offset:end].decode("utf-16-le").rstrip("\x00")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"malformed Registry.pol string at byte {offset}") from exc
+    return value, end + len(marker)
 
 
 def _decode_value(reg_type: int, raw: bytes) -> object:
     if reg_type in (REG_SZ, REG_EXPAND_SZ):
-        return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+        if len(raw) % 2:
+            raise ValueError("malformed odd-length Registry.pol string value")
+        return raw.decode("utf-16-le", errors="strict").rstrip("\x00")
     if reg_type == REG_MULTI_SZ:
+        if len(raw) % 2:
+            raise ValueError("malformed odd-length Registry.pol multi-string value")
         return tuple(
             item
-            for item in raw.decode("utf-16-le", errors="replace")
+            for item in raw.decode("utf-16-le", errors="strict")
             .rstrip("\x00")
             .split("\x00")
             if item
@@ -82,12 +92,12 @@ def parse_registry_pol(data: bytes) -> tuple[Setting, ...]:
         offset += size
         offset = _expect(data, offset, b"]\x00")
         settings.append(
-            Setting(
+            assess_setting(Setting(
                 kind=SettingKind.REGISTRY,
                 name=f"{key}\\{value_name}",
                 value={"type": reg_type, "data": _decode_value(reg_type, raw)},
                 required_extension=REGISTRY_CSE_GUID,
-            )
+            ))
         )
     return tuple(settings)
 

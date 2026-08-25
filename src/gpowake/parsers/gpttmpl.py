@@ -16,6 +16,16 @@ class _CaseConfigParser(configparser.RawConfigParser):
 def _decode(data: bytes) -> str:
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         return data.decode("utf-16")
+    # Windows templates are commonly UTF-16LE even when a third-party writer
+    # omits the BOM. Trying UTF-8 first would "succeed" with embedded NULs and
+    # then misparse every section.
+    if len(data) >= 4:
+        odd_nuls = data[1::2].count(0)
+        even_nuls = data[0::2].count(0)
+        if odd_nuls > len(data) // 8:
+            return data.decode("utf-16-le")
+        if even_nuls > len(data) // 8:
+            return data.decode("utf-16-be")
     for encoding in ("utf-8-sig", "utf-16-le", "cp1252"):
         try:
             decoded = data.decode(encoding)
@@ -72,22 +82,22 @@ def parse_gpttmpl(data: bytes | str) -> tuple[Setting, ...]:
     if parser.has_section("Group Membership"):
         for name, raw in parser.items("Group Membership"):
             settings.append(
-                Setting(
+                assess_setting(Setting(
                     kind=SettingKind.RESTRICTED_GROUP,
                     name=name.strip().replace("__", "/"),
                     value=_csv(raw),
                     required_extension=SECURITY_CSE_GUID,
-                )
+                ))
             )
     if parser.has_section("Registry Values"):
         for name, raw in parser.items("Registry Values"):
             settings.append(
-                Setting(
+                assess_setting(Setting(
                     kind=SettingKind.SECURITY_OPTION,
                     name=name.strip(),
                     value=_registry_value(raw),
                     required_extension=SECURITY_CSE_GUID,
-                )
+                ))
             )
     return tuple(settings)
 

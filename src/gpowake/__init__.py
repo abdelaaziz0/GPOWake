@@ -1,7 +1,7 @@
 """GPOWake's public API."""
 
-from .models import Environment, Finding
+from .models import CoverageGap, Environment, Finding
 from .solver import CounterfactualSolver
 
-__all__ = ["CounterfactualSolver", "Environment", "Finding"]
-__version__ = "0.1.0"
+__all__ = ["CounterfactualSolver", "CoverageGap", "Environment", "Finding"]
+__version__ = "0.3.0"

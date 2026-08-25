@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# Byte-compiled / cached Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---------------------------------------------------------------------------
+# Packaging / build output
+# ---------------------------------------------------------------------------
+build/
+dist/
+sdist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+MANIFEST
+pip-wheel-metadata/
+
+# ---------------------------------------------------------------------------
+# Test / coverage / type-checker / linter caches
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.tox/
+.nox/
+.cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.dmypy.json
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs / OS junk
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# GPOWake local outputs
+# Collected snapshots and generated reports can contain real domain data
+# (SIDs, DACLs, topology) and must never be pushed. Only the curated fixtures
+# under examples/ are tracked; these root-anchored patterns leave them alone.
+# ---------------------------------------------------------------------------
+/report.json
+/*-snapshot.json
+/snapshot*.json
+/*.report.json

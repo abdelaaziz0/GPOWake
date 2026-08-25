@@ -1,0 +1,11 @@
+include CHANGELOG.md
+include LICENSE
+include README.md
+include pyproject.toml
+recursive-include examples *.json
+recursive-include tests *.py
+recursive-include benchmarks *.py
+include scripts/check_release_archive.py
+include scripts/build_release.sh
+include scripts/verify_reproducible_build.py
+include scripts/normalize_release_archives.py

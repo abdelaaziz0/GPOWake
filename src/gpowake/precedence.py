@@ -3,14 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from .acl import can_apply_gpo, can_read_gpo
+from .acl import evaluate_apply_gpo, evaluate_read_gpo
 from .models import (
+    AccessDecision,
     DormancyReason,
     Environment,
     GPO,
     Link,
     ScopeOfManagement,
     Setting,
+    SettingKind,
     Target,
     normalize_dn,
 )
@@ -47,12 +49,47 @@ class EffectiveSetting:
 
 
 @dataclass(frozen=True)
+class PolicyUncertainty:
+    """An unknown policy input, scoped to what it can actually affect."""
+
+    reason: str
+    gate: str
+    gpo_dn: str | None = None
+    som_dn: str | None = None
+    link_order: int | None = None
+    setting_keys: tuple[tuple[str, str], ...] = ()
+    setting_kinds: tuple[SettingKind, ...] = ()
+
+    def affects(self, setting: Setting) -> bool:
+        if self.setting_keys and setting.key in self.setting_keys:
+            return True
+        if self.setting_kinds and setting.kind in self.setting_kinds:
+            return True
+        return not self.setting_keys and not self.setting_kinds
+
+
+@dataclass(frozen=True)
 class Evaluation:
     target: Target
     chain: tuple[ScopeOfManagement, ...]
     links: tuple[LinkEvaluation, ...]
     processing_order: tuple[LinkEvaluation, ...]
     winners: dict[tuple[str, str], EffectiveSetting]
+    uncertainties: tuple[PolicyUncertainty, ...] = ()
+
+    @property
+    def uncertainty_reasons(self) -> tuple[str, ...]:
+        """All reasons for display/backward compatibility, never as a solver gate."""
+
+        return tuple(dict.fromkeys(item.reason for item in self.uncertainties))
+
+    def uncertainties_for(self, setting: Setting) -> tuple[PolicyUncertainty, ...]:
+        return tuple(item for item in self.uncertainties if item.affects(setting))
+
+    def uncertainty_reasons_for(self, setting: Setting) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(item.reason for item in self.uncertainties_for(setting))
+        )
 
 
 class PolicyEngine:
@@ -65,19 +102,33 @@ class PolicyEngine:
         chain: list[ScopeOfManagement] = []
         seen: set[str] = set()
         current = self.environment.som(target.som_dn)
+        if current is None:
+            raise ValueError(
+                f"target {target.dn} refers to missing SOM {target.som_dn}"
+            )
         while current is not None:
             key = normalize_dn(current.dn)
             if key in seen:
                 raise ValueError(f"cycle in SOM hierarchy at {current.dn}")
             seen.add(key)
             chain.append(current)
-            current = (
-                self.environment.som(current.parent_dn) if current.parent_dn else None
-            )
+            if current.parent_dn:
+                parent = self.environment.som(current.parent_dn)
+                if parent is None:
+                    raise ValueError(
+                        f"SOM {current.dn} refers to missing parent {current.parent_dn}"
+                    )
+                current = parent
+            else:
+                current = None
         chain.reverse()
         if target.site_dn:
             site = self.environment.som(target.site_dn)
-            if site is not None and normalize_dn(site.dn) not in seen:
+            if site is None:
+                raise ValueError(
+                    f"target {target.dn} refers to missing site {target.site_dn}"
+                )
+            if normalize_dn(site.dn) not in seen:
                 chain.insert(0, site)
         return tuple(chain)
 
@@ -104,7 +155,26 @@ class PolicyEngine:
             )
         gpo = self.environment.gpo(link.gpo_dn)
         if gpo is None:
-            return LinkEvaluation(som, link, scope_index, LinkStatus.GPO_MISSING)
+            return LinkEvaluation(
+                som,
+                link,
+                scope_index,
+                LinkStatus.GPO_MISSING,
+                uncertain=True,
+                detail="linked GPO was not collected",
+            )
+        if (
+            gpo.functionality_version is None
+            and self.environment.collected_at is not None
+        ):
+            return LinkEvaluation(
+                som,
+                link,
+                scope_index,
+                LinkStatus.UNSUPPORTED,
+                uncertain=True,
+                detail="gPCFunctionalityVersion was not returned during collection",
+            )
         if gpo.functionality_version is not None and gpo.functionality_version != 2:
             return LinkEvaluation(
                 som,
@@ -113,8 +183,33 @@ class PolicyEngine:
                 LinkStatus.UNSUPPORTED,
                 detail=f"unsupported gPCFunctionalityVersion {gpo.functionality_version}",
             )
-        if not gpo.gpt_readable:
+        target_gpt_read = target.gpt_read_decision_for(gpo)
+        if target_gpt_read is AccessDecision.DENY:
             return LinkEvaluation(som, link, scope_index, LinkStatus.GPT_UNREADABLE)
+        if target_gpt_read is AccessDecision.UNKNOWN:
+            return LinkEvaluation(
+                som,
+                link,
+                scope_index,
+                LinkStatus.GPT_UNREADABLE,
+                uncertain=True,
+                detail="target GPT read authorization is unknown",
+            )
+        if target_gpt_read is None:
+            if self.environment.collected_at is not None:
+                return LinkEvaluation(
+                    som,
+                    link,
+                    scope_index,
+                    LinkStatus.GPT_UNREADABLE,
+                    uncertain=True,
+                    detail=(
+                        "collector GPT readability is not target GPT read "
+                        "authorization"
+                    ),
+                )
+            if not gpo.gpt_readable:
+                return LinkEvaluation(som, link, scope_index, LinkStatus.GPT_UNREADABLE)
         if gpo.computer_disabled:
             return LinkEvaluation(som, link, scope_index, LinkStatus.SECTION_DISABLED)
         uncertain = False
@@ -128,22 +223,61 @@ class PolicyEngine:
                 uncertain=True,
                 detail=gpo.security_descriptor.collection_error,
             )
-        elif not (
-            can_read_gpo(gpo.security_descriptor, target.all_sids)
-            and can_apply_gpo(gpo.security_descriptor, target.all_sids)
+        if target.token_incomplete and not target.unresolved_token_sids:
+            return LinkEvaluation(
+                som,
+                link,
+                scope_index,
+                LinkStatus.SECURITY_FILTERED,
+                uncertain=True,
+                detail=(
+                    "legacy snapshot marks the entire target token incomplete; "
+                    "trustee-scoped uncertainty is unavailable"
+                ),
+            )
+        read_result = evaluate_read_gpo(
+            gpo.security_descriptor,
+            target.all_sids,
+            unresolved_token_sids=target.unresolved_sids,
+        )
+        apply_result = evaluate_apply_gpo(
+            gpo.security_descriptor,
+            target.all_sids,
+            unresolved_token_sids=target.unresolved_sids,
+        )
+        if AccessDecision.UNKNOWN in {read_result.decision, apply_result.decision}:
+            return LinkEvaluation(
+                som,
+                link,
+                scope_index,
+                LinkStatus.SECURITY_FILTERED,
+                uncertain=True,
+                detail=(
+                    "security-filter authorization is unknown "
+                    f"(read={read_result.decision.value}, "
+                    f"apply={apply_result.decision.value})"
+                ),
+            )
+        if (
+            read_result.decision is not AccessDecision.ALLOW
+            or apply_result.decision is not AccessDecision.ALLOW
         ):
             return LinkEvaluation(som, link, scope_index, LinkStatus.SECURITY_FILTERED)
         if gpo.wmi_filter:
-            if gpo.wmi_result is False:
+            target_wmi_result = target.wmi_result_for(gpo.wmi_filter)
+            if target_wmi_result is False or gpo.wmi_result is False:
                 return LinkEvaluation(som, link, scope_index, LinkStatus.WMI_FILTERED)
-            if gpo.wmi_result is None:
+            if target_wmi_result is None:
                 return LinkEvaluation(
                     som,
                     link,
                     scope_index,
                     LinkStatus.WMI_FILTERED,
                     uncertain=True,
-                    detail="WMI filter result was not evaluated",
+                    detail=(
+                        "WMI filter result was not evaluated for this target; "
+                        "a legacy global true result is not accepted"
+                    ),
                 )
         return LinkEvaluation(
             som, link, scope_index, LinkStatus.APPLIES, uncertain, detail
@@ -172,10 +306,68 @@ class PolicyEngine:
             )
         )
         winners: dict[tuple[str, str], EffectiveSetting] = {}
+        uncertainties: list[PolicyUncertainty] = []
+        if target.site_resolution_error:
+            uncertainties.append(
+                PolicyUncertainty(target.site_resolution_error, "SITE_RESOLUTION")
+            )
+        for item in links:
+            if not item.uncertain or not item.detail:
+                continue
+            gpo = self.environment.gpo(item.link.gpo_dn)
+            if gpo is None:
+                uncertainties.append(
+                    PolicyUncertainty(
+                        f"{item.som.dn} link order {item.link.order}: {item.detail}",
+                        "GPO_COLLECTION",
+                        som_dn=item.som.dn,
+                        link_order=item.link.order,
+                    )
+                )
+                continue
+            incomplete_kinds = (
+                gpo.incomplete_setting_kinds
+                if not gpo.settings_complete
+                else ()
+            )
+            legacy_unscoped = not gpo.settings_complete and not incomplete_kinds
+            uncertainties.append(
+                PolicyUncertainty(
+                    f"{item.som.dn} link order {item.link.order}: {item.detail}",
+                    {
+                        LinkStatus.SECURITY_FILTERED: "SECURITY_FILTER",
+                        LinkStatus.GPT_UNREADABLE: "TARGET_GPT_READ",
+                        LinkStatus.WMI_FILTERED: "WMI_FILTER",
+                        LinkStatus.UNSUPPORTED: "GPO_METADATA",
+                    }.get(item.status, "POLICY_GATE"),
+                    gpo_dn=gpo.dn,
+                    som_dn=item.som.dn,
+                    link_order=item.link.order,
+                    setting_keys=(
+                        ()
+                        if legacy_unscoped
+                        else tuple(setting.key for setting in gpo.settings)
+                    ),
+                    setting_kinds=incomplete_kinds,
+                )
+            )
         for application in processing:
             gpo = self.environment.gpo(application.link.gpo_dn)
             if gpo is None:
                 continue
+            if not gpo.settings_complete:
+                reasons = gpo.settings_uncertainty_reasons or (
+                    "one or more supported GPT policy files were not collected",
+                )
+                for reason in reasons:
+                    uncertainties.append(
+                        PolicyUncertainty(
+                            f"{gpo.name}: {reason}",
+                            "GPT_SETTINGS",
+                            gpo_dn=gpo.dn,
+                            setting_kinds=gpo.incomplete_setting_kinds,
+                        )
+                    )
             for setting in gpo.settings:
                 extension_uncertain = False
                 if setting.required_extension and gpo.machine_extensions is not None:
@@ -189,13 +381,29 @@ class PolicyEngine:
                         continue
                 elif setting.required_extension and gpo.machine_extensions is None:
                     extension_uncertain = True
+                    uncertainties.append(
+                        PolicyUncertainty(
+                            f"{gpo.name}: machine CSE advertisement is unknown for "
+                            f"{setting.name}",
+                            "CSE_ADVERTISEMENT",
+                            gpo_dn=gpo.dn,
+                            setting_keys=(setting.key,),
+                        )
+                    )
                 winners[setting.key] = EffectiveSetting(
                     setting=setting,
                     gpo=gpo,
                     application=application,
                     uncertain=application.uncertain or extension_uncertain,
                 )
-        return Evaluation(target, chain, links, processing, winners)
+        return Evaluation(
+            target,
+            chain,
+            links,
+            processing,
+            winners,
+            tuple(dict.fromkeys(uncertainties)),
+        )
 
     def dormancy_reason(
         self,

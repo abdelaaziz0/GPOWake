@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import io
 from dataclasses import replace
 
-from ..models import Environment
+from ..models import Environment, SettingKind
 from ..parsers.gpttmpl import parse_gpttmpl
 from ..parsers.registry_pol import parse_registry_pol
 from .ldap import CollectionConfig
@@ -18,13 +19,31 @@ def _unc_parts(unc: str) -> tuple[str, str]:
 
 
 def _gpt_version(data: bytes) -> int | None:
-    text = data.decode("utf-8-sig", errors="replace")
-    parser = configparser.ConfigParser()
-    parser.read_file(io.StringIO(text))
     try:
+        text = data.decode("utf-8-sig", errors="strict")
+        parser = configparser.ConfigParser()
+        parser.read_file(io.StringIO(text))
         return parser.getint("General", "Version")
-    except (configparser.Error, ValueError):
+    except (UnicodeDecodeError, configparser.Error, ValueError):
         return None
+
+
+def _validated_gpt_location(
+    unc: str, config: CollectionConfig, guid: str
+) -> tuple[str, str]:
+    share, root = _unc_parts(unc)
+    root_parts = [part for part in root.replace("/", "\\").split("\\") if part]
+    if share.casefold() != "sysvol":
+        raise ValueError("gPCFileSysPath does not reference the SYSVOL share")
+    if len(root_parts) != 3:
+        raise ValueError("gPCFileSysPath is not a GPO root")
+    if root_parts[0].casefold() != config.domain.casefold():
+        raise ValueError("gPCFileSysPath domain does not match the collected domain")
+    if root_parts[1].casefold() != "policies":
+        raise ValueError("gPCFileSysPath is outside SYSVOL Policies")
+    if root_parts[2].strip("{}").casefold() != guid.strip("{}").casefold():
+        raise ValueError("gPCFileSysPath GUID does not match the GPO")
+    return share, "\\".join(root_parts)
 
 
 def collect_sysvol(environment: Environment, config: CollectionConfig) -> Environment:
@@ -36,7 +55,8 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
         ) from exc
 
     remote_name = config.dc_host or config.domain
-    smb = SMBConnection(remote_name, config.dc_ip)
+    environment.smb_endpoint = f"smb://{remote_name} (peer {config.dc_ip})"
+    smb = SMBConnection(remote_name, config.dc_ip, timeout=config.smb_timeout)
     auth = config.auth
     if auth.kerberos:
         smb.kerberosLogin(
@@ -55,7 +75,18 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
 
     def read_file(share: str, path: str) -> bytes:
         chunks: list[bytes] = []
-        smb.getFile(share, path, chunks.append)
+        total = 0
+
+        def append_chunk(chunk: bytes) -> None:
+            nonlocal total
+            total += len(chunk)
+            if total > config.max_sysvol_file_bytes:
+                raise RuntimeError(
+                    f"SYSVOL file exceeds {config.max_sysvol_file_bytes} bytes"
+                )
+            chunks.append(chunk)
+
+        smb.getFile(share, path, append_chunk)
         return b"".join(chunks)
 
     for key, original in list(environment.gpos.items()):
@@ -63,38 +94,75 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
             f"\\\\{config.domain}\\SYSVOL\\{config.domain}\\Policies\\{original.guid}"
         )
         try:
-            share, root = _unc_parts(unc)
+            share, root = _validated_gpt_location(unc, config, original.guid)
             gpt_data = read_file(share, root + "\\gpt.ini")
         except Exception as exc:
             environment.warnings.append(
                 f"{original.name}: cannot read GPT from {unc}: {exc}"
             )
-            environment.gpos[key] = replace(original, gpt_readable=False)
+            environment.gpos[key] = replace(
+                original,
+                collector_gpt_readable=False,
+                settings_complete=False,
+                settings_uncertainty_reasons=(f"GPT collection failed: {exc}",),
+                incomplete_setting_kinds=tuple(SettingKind),
+            )
             continue
         settings = list(original.settings)
+        settings_complete = True
+        settings_uncertainty_reasons: list[str] = []
+        incomplete_setting_kinds: list[SettingKind] = []
+        hashes: list[tuple[str, str]] = [
+            ("gpt.ini", hashlib.sha256(gpt_data).hexdigest())
+        ]
         paths = (
-            ("Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf", parse_gpttmpl),
-            ("Machine\\Registry.pol", parse_registry_pol),
+            (
+                "Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf",
+                parse_gpttmpl,
+                (
+                    SettingKind.PRIVILEGE_RIGHT,
+                    SettingKind.RESTRICTED_GROUP,
+                    SettingKind.SECURITY_OPTION,
+                ),
+            ),
+            ("Machine\\Registry.pol", parse_registry_pol, (SettingKind.REGISTRY,)),
         )
-        for relative, parser in paths:
+        for relative, parser, setting_kinds in paths:
             try:
-                settings.extend(parser(read_file(share, root + "\\" + relative)))
+                policy_data = read_file(share, root + "\\" + relative)
+                hashes.append((relative, hashlib.sha256(policy_data).hexdigest()))
+                settings.extend(parser(policy_data))
             except Exception as exc:
                 # Missing optional policy files are normal; malformed/read-denied
                 # files are retained as warnings without discarding other CSEs.
                 message = str(exc)
+                message_upper = message.upper()
                 if (
-                    "STATUS_OBJECT_NAME_NOT_FOUND" not in message
-                    and "STATUS_NO_SUCH_FILE" not in message
+                    "STATUS_OBJECT_NAME_NOT_FOUND" not in message_upper
+                    and "STATUS_NO_SUCH_FILE" not in message_upper
                 ):
+                    settings_complete = False
+                    settings_uncertainty_reasons.append(
+                        f"could not collect {relative}: {exc}"
+                    )
+                    incomplete_setting_kinds.extend(setting_kinds)
                     environment.warnings.append(
                         f"{original.name}: could not collect {relative}: {exc}"
                     )
+        gpt_version = _gpt_version(gpt_data)
+        if gpt_version is None:
+            environment.warnings.append(
+                f"{original.name}: gpt.ini version is missing or malformed"
+            )
         environment.gpos[key] = replace(
             original,
             settings=tuple(settings),
-            gpt_readable=True,
-            gpt_version=_gpt_version(gpt_data),
+            collector_gpt_readable=True,
+            settings_complete=settings_complete,
+            settings_uncertainty_reasons=tuple(settings_uncertainty_reasons),
+            incomplete_setting_kinds=tuple(dict.fromkeys(incomplete_setting_kinds)),
+            gpt_version=gpt_version,
+            gpt_hashes=tuple(hashes),
         )
     try:
         smb.logoff()
