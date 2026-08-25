@@ -39,6 +39,13 @@ class SettingKind(str, Enum):
     REGISTRY = "REGISTRY"
 
 
+class ValueSensitivity(str, Enum):
+    """How a setting value may be retained or rendered."""
+
+    PUBLIC = "PUBLIC"
+    SECRET = "SECRET"
+
+
 class SomKind(str, Enum):
     SITE = "SITE"
     DOMAIN = "DOMAIN"
@@ -214,6 +221,9 @@ class Setting:
     # snapshot setting with no rule ID remains an explicit user override.
     risk_rule_id: str | None = None
     unexpected_trustees: tuple[str, ...] = ()
+    # SECRET values are destroyed at ingestion and may only be represented by
+    # a presence marker. Serializers and renderers enforce this again.
+    value_sensitivity: ValueSensitivity = ValueSensitivity.PUBLIC
 
     @property
     def key(self) -> tuple[str, str]:
@@ -251,6 +261,8 @@ class GPO:
     usn_changed: int | None = None
     # Relative GPT path -> SHA-256, collected from the same SMB endpoint.
     gpt_hashes: tuple[tuple[str, str], ...] = ()
+    # Relative GPT path -> byte length, collected from the same read as the hash.
+    gpt_file_sizes: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
         if not 0 <= self.flags <= 0xFFFFFFFF:
@@ -267,6 +279,31 @@ class GPO:
             raise ValueError(
                 "a settings-complete GPO cannot declare incomplete setting kinds"
             )
+        hash_paths = [path.replace("/", "\\").casefold() for path, _ in self.gpt_hashes]
+        size_paths = [
+            path.replace("/", "\\").casefold() for path, _ in self.gpt_file_sizes
+        ]
+        if len(hash_paths) != len(set(hash_paths)):
+            raise ValueError("GPO GPT hash paths must be unique")
+        if len(size_paths) != len(set(size_paths)):
+            raise ValueError("GPO GPT size paths must be unique")
+        if any(type(size) is not int or size < 0 for _path, size in self.gpt_file_sizes):
+            raise ValueError("GPO GPT file sizes must be non-negative integers")
+        if size_paths and set(size_paths) != set(hash_paths):
+            raise ValueError("GPO GPT hash and size paths must match exactly")
+        for path, digest in self.gpt_hashes:
+            canonical = path.replace("/", "\\")
+            parts = canonical.split("\\")
+            if canonical.startswith("\\") or ":" in canonical or any(
+                part in {"", ".", ".."} for part in parts
+            ):
+                raise ValueError(f"GPO GPT path is unsafe: {path!r}")
+            if len(digest) != 64:
+                raise ValueError("GPO GPT SHA-256 must contain 64 hex digits")
+            try:
+                bytes.fromhex(digest)
+            except ValueError as exc:
+                raise ValueError("GPO GPT SHA-256 must be hexadecimal") from exc
 
     @property
     def computer_disabled(self) -> bool:
@@ -309,6 +346,7 @@ class GptAccessProbe:
     relative_path: str
     status: str
     sha256: str | None = None
+    size: int | None = None
 
     def __post_init__(self) -> None:
         if not self.relative_path.strip():
@@ -317,8 +355,14 @@ class GptAccessProbe:
             raise ValueError("GPT access probe has an unsupported status")
         if self.status == "READ_OK" and self.sha256 is None:
             raise ValueError("a successful GPT access probe requires SHA-256")
+        if self.status == "READ_OK" and (
+            type(self.size) is not int or self.size < 0
+        ):
+            raise ValueError("a successful GPT access probe requires a byte size")
         if self.status == "ACCESS_DENIED" and self.sha256 is not None:
             raise ValueError("an access-denied GPT probe cannot carry file SHA-256")
+        if self.status == "ACCESS_DENIED" and self.size is not None:
+            raise ValueError("an access-denied GPT probe cannot carry a byte size")
         if self.sha256 is not None:
             if len(self.sha256) != 64:
                 raise ValueError("GPT access probe SHA-256 must contain 64 hex digits")
@@ -345,6 +389,8 @@ class GptAccessObservation:
     target_sid: str
     token_sids_sha256: str
     credential_principal: str
+    authenticated_sid: str
+    identity_attestation: str
     gpo_ad_version: int
     gpt_version: int
     share_sd_sha256: str | None
@@ -385,6 +431,8 @@ class GptAccessObservation:
             ("DC", self.dc),
             ("target SID", self.target_sid),
             ("credential principal", self.credential_principal),
+            ("authenticated SID", self.authenticated_sid),
+            ("identity attestation", self.identity_attestation),
         ):
             if not value.strip():
                 raise ValueError(f"GPT access observation requires {field_name}")
@@ -410,6 +458,37 @@ class GptAccessObservation:
                 raise ValueError(f"{field_name} hash must be hexadecimal") from exc
         if not self.probes:
             raise ValueError("GPT access observation requires at least one file probe")
+        if normalize_sid(self.authenticated_sid) != normalize_sid(self.target_sid):
+            raise ValueError("authenticated SID must equal the bound snapshot target SID")
+        if self.decision is not self.decision_for():
+            raise ValueError("GPT aggregate decision does not match its file probes")
+
+    def decision_for(self, kind: SettingKind | None = None) -> AccessDecision:
+        """Return the global or supported setting-family result for this evidence."""
+
+        by_path = {probe.relative_path.replace("/", "\\").casefold(): probe for probe in self.probes}
+        root = by_path.get("gpt.ini")
+        if root is None:
+            return AccessDecision.UNKNOWN
+        if root.status == "ACCESS_DENIED":
+            return AccessDecision.DENY
+        if kind is None:
+            statuses = {probe.status for probe in self.probes}
+            if statuses == {"READ_OK"}:
+                return AccessDecision.ALLOW
+            if "ACCESS_DENIED" in statuses:
+                return AccessDecision.UNKNOWN
+            return AccessDecision.UNKNOWN
+        family_paths = [
+            probe
+            for path, probe in by_path.items()
+            if kind in setting_kinds_for_gpt_path(path)
+        ]
+        if not family_paths:
+            return AccessDecision.UNKNOWN
+        if any(probe.status == "ACCESS_DENIED" for probe in family_paths):
+            return AccessDecision.DENY
+        return AccessDecision.ALLOW
 
 
 @dataclass(frozen=True)
@@ -419,6 +498,9 @@ class Target:
     sid: str
     som_dn: str
     token_sids: tuple[str, ...]
+    sam_account_name: str | None = None
+    dns_domain: str | None = None
+    netbios_domain: str | None = None
     site_dn: str | None = None
     criticality: str = "NORMAL"
     # Legacy all-or-nothing marker retained for schema-1 compatibility. New
@@ -447,10 +529,38 @@ class Target:
                 return bool(result)
         return None
 
-    def gpt_read_decision_for(self, gpo: GPO) -> AccessDecision | None:
+    def gpt_read_decision_for(
+        self, gpo: GPO, setting_kind: SettingKind | None = None
+    ) -> AccessDecision | None:
         for observation in self.gpt_read_observations:
             if gpo.matches_identifier(observation.gpo_id):
-                return AccessDecision(observation.decision)
+                return observation.decision_for(setting_kind)
+        for gpo_id, decision in self.gpt_read_decisions:
+            if gpo.matches_identifier(gpo_id):
+                return AccessDecision(decision)
+        return None
+
+    def gpt_root_read_decision_for(self, gpo: GPO) -> AccessDecision | None:
+        """Return only the gpt.ini gate, independent of policy-file families."""
+
+        for observation in self.gpt_read_observations:
+            if not gpo.matches_identifier(observation.gpo_id):
+                continue
+            root = next(
+                (
+                    probe
+                    for probe in observation.probes
+                    if probe.relative_path.replace("/", "\\").casefold() == "gpt.ini"
+                ),
+                None,
+            )
+            if root is None:
+                return AccessDecision.UNKNOWN
+            return (
+                AccessDecision.ALLOW
+                if root.status == "READ_OK"
+                else AccessDecision.DENY
+            )
         for gpo_id, decision in self.gpt_read_decisions:
             if gpo.matches_identifier(gpo_id):
                 return AccessDecision(decision)
@@ -461,6 +571,9 @@ class Target:
 class GptAccessProvenance:
     target: str
     target_sid: str
+    authenticated_sid: str
+    credential_principal: str
+    identity_attestation: str
     decision: AccessDecision
     source: GptAccessSource
     oracle: str
@@ -592,6 +705,8 @@ class Finding:
     confidence_reasons: tuple[str, ...] = ()
     uncertainty_reasons: tuple[str, ...] = ()
     rule_id: str | None = None
+    value_sensitivity: ValueSensitivity = ValueSensitivity.PUBLIC
+    current_value_sensitivity: ValueSensitivity = ValueSensitivity.PUBLIC
     current_value: Any = None
     newly_privileged_trustees: tuple[str, ...] = ()
     target_role: str = "NORMAL"
@@ -636,3 +751,18 @@ def normalize_sid(value: str) -> str:
 
 def unique_normalized_sids(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(normalize_sid(v) for v in values if v))
+
+
+def setting_kinds_for_gpt_path(relative_path: str) -> tuple[SettingKind, ...]:
+    """Map the supported GPT files to the setting families they control."""
+
+    path = relative_path.replace("/", "\\").casefold()
+    if path == "machine\\microsoft\\windows nt\\secedit\\gpttmpl.inf":
+        return (
+            SettingKind.PRIVILEGE_RIGHT,
+            SettingKind.RESTRICTED_GROUP,
+            SettingKind.SECURITY_OPTION,
+        )
+    if path == "machine\\registry.pol":
+        return (SettingKind.REGISTRY,)
+    return ()

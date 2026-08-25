@@ -332,6 +332,48 @@ def test_restricted_administrators_delta_excludes_existing_member() -> None:
     ) == (added,)
 
 
+@pytest.mark.parametrize(
+    ("name", "candidate_value", "current_value", "unexpected"),
+    (
+        (
+            "S-1-5-32-544/Members",
+            ("S-1-5-21-1-2-3-1100",),
+            ("S-1-5-21-1-2-3-1100", "S-1-5-21-1-2-3-1101"),
+            "S-1-5-21-1-2-3-1100",
+        ),
+        (
+            "S-1-5-21-1-2-3-1100/MemberOf",
+            ("S-1-5-32-544",),
+            ("S-1-5-32-544", "S-1-5-32-545"),
+            "S-1-5-21-1-2-3-1100",
+        ),
+    ),
+)
+def test_restricted_group_removal_only_overlap_emits_no_finding(
+    name, candidate_value, current_value, unexpected
+) -> None:
+    candidate = Setting(
+        SettingKind.RESTRICTED_GROUP,
+        name,
+        candidate_value,
+        dangerous=True,
+        severity=Severity.CRITICAL,
+        unexpected_trustees=(unexpected,),
+    )
+    current = Setting(SettingKind.RESTRICTED_GROUP, name, current_value)
+    env = environment(
+        ou_links=(Link(DANGEROUS_DN, 0, 2), Link(SAFE_DN, 0, 1)),
+        ou_sd=som_sd(GPLINK_GUID),
+        danger=dangerous_gpo(settings=(candidate,)),
+    )
+    safe = env.gpo(SAFE_DN)
+    assert safe is not None
+    env.gpos[safe.dn.casefold()] = replace(safe, settings=(current,))
+
+    findings = CounterfactualSolver(env).solve()
+    assert not [item for item in findings if item.setting_name == name]
+
+
 # --------------------------------------------------------------------------
 # 6. Add-link transitions consider every applicable scope, not just the OU.
 # --------------------------------------------------------------------------

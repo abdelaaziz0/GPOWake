@@ -16,6 +16,7 @@ from gpowake.collectors.ldap import (
     _trustee_object_kind,
 )
 from gpowake.collectors.sysvol import (
+    SysvolBudgetExceeded,
     collect_sysvol,
     _gpt_version,
     _unc_parts,
@@ -183,6 +184,43 @@ def test_sysvol_failure_is_scoped_to_the_failed_policy_family(monkeypatch) -> No
     assert collected.settings_complete is False
     assert collected.incomplete_setting_kinds == (SettingKind.REGISTRY,)
     assert any("Registry.pol access denied" in reason for reason in collected.settings_uncertainty_reasons)
+
+
+def test_sysvol_aggregate_byte_budget_aborts_collection(monkeypatch) -> None:
+    impacket = ModuleType("impacket")
+    impacket.__path__ = []
+    smb_module = ModuleType("impacket.smbconnection")
+
+    class FakeSmb:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def login(self, *args, **kwargs):
+            pass
+
+        def getFile(self, share, path, callback):
+            callback(b"12345")
+
+    smb_module.SMBConnection = FakeSmb
+    monkeypatch.setitem(sys.modules, "impacket", impacket)
+    monkeypatch.setitem(sys.modules, "impacket.smbconnection", smb_module)
+    gpo = GPO(
+        dn="CN={AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA},CN=Policies,DC=corp,DC=local",
+        guid="{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}",
+        name="Budgeted",
+    )
+    env = Environment(
+        soms={}, gpos={gpo.dn.casefold(): gpo}, principals=[], targets=[]
+    )
+    with pytest.raises(SysvolBudgetExceeded, match="aggregate byte"):
+        collect_sysvol(
+            env,
+            CollectionConfig(
+                domain="corp.local",
+                dc_ip="10.0.0.1",
+                max_sysvol_total_bytes=4,
+            ),
+        )
 
 
 def _fake_ldap3(monkeypatch, captured: dict) -> None:

@@ -22,11 +22,12 @@ from .models import (
 )
 
 
-OBSERVATION_SCHEMA_VERSION = 2
+OBSERVATION_SCHEMA_VERSION = 3
 MAX_OBSERVATION_FILE_BYTES = 8 * 1024 * 1024
 GPT_FILE_GENERIC_READ = 0x00120089
 MAX_COLLECTION_OBSERVATION_SKEW = timedelta(minutes=30)
 SMB_ORACLE_NAME = "gpowake-smb-effective-io"
+SMB_IDENTITY_ATTESTATION = "PINNED_LDAP_BIND_OBJECT_SID"
 _SHA256_RE = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
@@ -55,11 +56,24 @@ def token_sids_sha256(target: Target) -> str:
 
 
 def machine_credential_matches(target: Target, principal: str) -> bool:
-    """Require the authenticated principal to name this target's machine account."""
+    """Require an exact LDAP-collected domain and machine-account identity."""
 
-    account = principal.rsplit("\\", 1)[-1].split("@", 1)[0].casefold()
-    host = target.name.split(".", 1)[0].rstrip("$").casefold()
-    return account == f"{host}$"
+    if not all(
+        (target.sam_account_name, target.dns_domain, target.netbios_domain)
+    ):
+        return False
+    if "\\" in principal and "@" not in principal:
+        domain, account = principal.split("\\", 1)
+        expected_domain = target.netbios_domain
+    elif "@" in principal and "\\" not in principal:
+        account, domain = principal.rsplit("@", 1)
+        expected_domain = target.dns_domain
+    else:
+        return False
+    return (
+        domain.casefold() == str(expected_domain).casefold()
+        and account.casefold() == str(target.sam_account_name).casefold()
+    )
 
 
 def target_matches(target: Target, selector: str) -> bool:
@@ -148,12 +162,12 @@ def _probe_rows(value: object, field: str) -> tuple[GptAccessProbe, ...]:
         raise ValueError(f"{field} must be a non-empty JSON array")
     probes: list[GptAccessProbe] = []
     seen: set[str] = set()
-    allowed = {"relative_path", "status", "sha256"}
+    allowed = {"relative_path", "status", "sha256", "size"}
     for index, row in enumerate(value):
         item_field = f"{field}[{index}]"
         if not isinstance(row, dict) or set(row) != allowed:
             raise ValueError(
-                f"{item_field} must contain exactly relative_path, status, sha256"
+                f"{item_field} must contain exactly relative_path, status, sha256, size"
             )
         relative = _relative_path(row["relative_path"], f"{item_field}.relative_path")
         key = relative.casefold()
@@ -162,7 +176,10 @@ def _probe_rows(value: object, field: str) -> tuple[GptAccessProbe, ...]:
         seen.add(key)
         status = _text(row["status"], f"{item_field}.status", max_length=32)
         digest = _digest(row["sha256"], f"{item_field}.sha256", allow_none=True)
-        probes.append(GptAccessProbe(relative, status, digest))
+        size = row["size"]
+        if size is not None and (type(size) is not int or size < 0):
+            raise ValueError(f"{item_field}.size must be a non-negative integer or null")
+        probes.append(GptAccessProbe(relative, status, digest, size))
     return tuple(probes)
 
 
@@ -172,32 +189,50 @@ def _validate_probe_binding(
     gpo: GPO,
     field: str,
 ) -> None:
-    expected = {path.casefold(): digest.casefold() for path, digest in gpo.gpt_hashes}
+    expected = {
+        path.replace("/", "\\").casefold(): digest.casefold()
+        for path, digest in gpo.gpt_hashes
+    }
+    expected_sizes = {
+        path.replace("/", "\\").casefold(): size
+        for path, size in gpo.gpt_file_sizes
+    }
     if not expected:
         raise ValueError(
             f"{field} cannot bind evidence because the snapshot has no GPT hashes"
         )
     actual = {probe.relative_path.casefold(): probe for probe in probes}
-    unknown = set(actual) - set(expected)
-    if unknown:
+    if set(actual) != set(expected):
         raise ValueError(
-            f"{field} probes path(s) absent from the snapshot: "
-            + ", ".join(sorted(unknown))
+            f"{field} must probe every and only snapshot-hashed GPT file"
         )
+    if set(expected_sizes) != set(expected):
+        raise ValueError(f"{field} cannot bind evidence without every GPT file size")
     for path, probe in actual.items():
         if probe.status == "READ_OK" and probe.sha256 != expected[path]:
             raise ValueError(
                 f"{field} file hash differs from the bound snapshot for "
                 f"{probe.relative_path}"
             )
-    denied = [probe for probe in probes if probe.status == "ACCESS_DENIED"]
-    if decision is AccessDecision.ALLOW:
-        if denied or set(actual) != set(expected):
+        if probe.status == "READ_OK" and probe.size != expected_sizes[path]:
             raise ValueError(
-                f"{field} ALLOW requires successful probes for every hashed GPT file"
+                f"{field} file size differs from the bound snapshot for "
+                f"{probe.relative_path}"
             )
-    elif not denied:
-        raise ValueError(f"{field} DENY requires an actual ACCESS_DENIED probe")
+    root = actual.get("gpt.ini")
+    if root is None:
+        raise ValueError(f"{field} lacks the global gpt.ini probe")
+    expected_decision = (
+        AccessDecision.DENY
+        if root.status == "ACCESS_DENIED"
+        else AccessDecision.ALLOW
+        if all(probe.status == "READ_OK" for probe in probes)
+        else AccessDecision.UNKNOWN
+    )
+    if decision is not expected_decision:
+        raise ValueError(
+            f"{field} aggregate decision does not match its per-file probes"
+        )
 
 
 def validate_stored_observation(
@@ -206,11 +241,9 @@ def validate_stored_observation(
     gpo: GPO,
     observation: GptAccessObservation,
 ) -> None:
-    """Revalidate imported evidence when a schema-4 snapshot is loaded."""
+    """Revalidate imported evidence when a schema-5 snapshot is loaded."""
 
     field = f"{target.name}/{gpo.name} GPT access observation"
-    if observation.decision is AccessDecision.UNKNOWN:
-        raise ValueError(f"{field} cannot contain an UNKNOWN decision")
     if observation.desired_access != GPT_FILE_GENERIC_READ:
         raise ValueError(f"{field} has an unsupported desired-access mask")
     if environment.collected_at is None:
@@ -239,6 +272,8 @@ def validate_stored_observation(
         raise ValueError(f"{field} target token hash does not match")
     if not machine_credential_matches(target, observation.credential_principal):
         raise ValueError(f"{field} credential is not the target machine account")
+    if normalize_sid(observation.authenticated_sid) != normalize_sid(target.sid):
+        raise ValueError(f"{field} authenticated SID does not match the target")
     if observation.gpo_ad_version != gpo.version_number:
         raise ValueError(f"{field} AD version does not match")
     if observation.gpt_version != gpo.gpt_version:
@@ -249,6 +284,8 @@ def validate_stored_observation(
             or observation.oracle_version != __version__
         ):
             raise ValueError(f"{field} identifies an unsupported SMB oracle")
+        if observation.identity_attestation != SMB_IDENTITY_ATTESTATION:
+            raise ValueError(f"{field} lacks pinned LDAP SID attestation")
         if (
             observation.share_sd_sha256 is not None
             or observation.ntfs_sd_sha256 is not None
@@ -274,9 +311,7 @@ def _observation_from_row(
     try:
         decision = AccessDecision(row["decision"])
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field}.decision must be ALLOW or DENY") from exc
-    if decision is AccessDecision.UNKNOWN:
-        raise ValueError(f"{field}.decision must be ALLOW or DENY")
+        raise ValueError(f"{field}.decision must be ALLOW, DENY, or UNKNOWN") from exc
     try:
         source = GptAccessSource(_text(row["source"], f"{field}.source"))
     except ValueError as exc:
@@ -328,6 +363,16 @@ def _observation_from_row(
         raise ValueError(
             f"{field}.credential_principal is not the selected target machine account"
         )
+    authenticated_sid = _text(
+        row["authenticated_sid"], f"{field}.authenticated_sid"
+    )
+    if normalize_sid(authenticated_sid) != normalize_sid(target.sid):
+        raise ValueError(
+            f"{field}.authenticated_sid does not match the selected target"
+        )
+    identity_attestation = _text(
+        row["identity_attestation"], f"{field}.identity_attestation"
+    )
     ad_version = row["gpo_ad_version"]
     gpt_version = row["gpt_version"]
     if type(ad_version) is not int or ad_version != gpo.version_number:
@@ -345,6 +390,8 @@ def _observation_from_row(
             raise ValueError(
                 f"{field} does not identify this supported SMB oracle version"
             )
+        if identity_attestation != SMB_IDENTITY_ATTESTATION:
+            raise ValueError(f"{field} lacks pinned LDAP SID attestation")
         if share_hash is not None or ntfs_hash is not None:
             raise ValueError(
                 f"{field} effective-I/O evidence must not claim descriptor hashes"
@@ -369,6 +416,8 @@ def _observation_from_row(
         target.sid,
         token_digest,
         credential,
+        authenticated_sid,
+        identity_attestation,
         ad_version,
         gpt_version,
         share_hash,
@@ -394,7 +443,12 @@ def import_gpt_access_observations(
     document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ValueError("observation document root must be a JSON object")
-    allowed_root = {"schema_version", "snapshot_sha256", "observations"}
+    allowed_root = {
+        "schema_version",
+        "snapshot_sha256",
+        "preflight",
+        "observations",
+    }
     if set(document) != allowed_root:
         unknown = set(document) - allowed_root
         missing = allowed_root - set(document)
@@ -410,12 +464,33 @@ def import_gpt_access_observations(
             f"{OBSERVATION_SCHEMA_VERSION}"
         )
     bound_digest = _digest(document["snapshot_sha256"], "snapshot_sha256")
-    assert bound_digest is not None
+    if bound_digest is None:
+        raise ValueError("snapshot_sha256 cannot be null")
     if bound_digest != snapshot_sha256.casefold():
         raise ValueError("observation document is bound to a different snapshot")
     rows = document["observations"]
     if not isinstance(rows, list) or not rows:
         raise ValueError("observations must be a non-empty JSON array")
+    preflight = document["preflight"]
+    preflight_fields = {
+        "selected_gpos",
+        "total_files",
+        "total_probes",
+        "total_bytes",
+        "max_total_files",
+        "max_total_probes",
+        "max_total_bytes",
+    }
+    if not isinstance(preflight, dict) or set(preflight) != preflight_fields:
+        raise ValueError("preflight must contain exactly the aggregate oracle budgets")
+    if any(type(preflight[field]) is not int or preflight[field] < 0 for field in preflight_fields):
+        raise ValueError("preflight counters and limits must be non-negative integers")
+    if preflight["total_files"] > preflight["max_total_files"]:
+        raise ValueError("preflight file count exceeds its recorded limit")
+    if preflight["total_probes"] > preflight["max_total_probes"]:
+        raise ValueError("preflight probe count exceeds its recorded limit")
+    if preflight["total_bytes"] > preflight["max_total_bytes"]:
+        raise ValueError("preflight byte count exceeds its recorded limit")
 
     allowed_row = {
         "target",
@@ -431,6 +506,8 @@ def import_gpt_access_observations(
         "target_sid",
         "token_sids_sha256",
         "credential_principal",
+        "authenticated_sid",
+        "identity_attestation",
         "gpo_ad_version",
         "gpt_version",
         "share_sd_sha256",
@@ -479,6 +556,20 @@ def import_gpt_access_observations(
                 ),
             )
         )
+
+    bound_gpos = [gpo for _target, gpo, _item in resolved]
+    expected_files = sum(len(gpo.gpt_hashes) for gpo in bound_gpos)
+    expected_bytes = sum(
+        size for gpo in bound_gpos for _path, size in gpo.gpt_file_sizes
+    )
+    if preflight["selected_gpos"] != len(bound_gpos):
+        raise ValueError("preflight selected-GPO count does not match observations")
+    if preflight["total_files"] != expected_files:
+        raise ValueError("preflight file count does not match snapshot-bound GPOs")
+    if preflight["total_probes"] != expected_files:
+        raise ValueError("preflight probe count does not match snapshot-bound GPOs")
+    if preflight["total_bytes"] != expected_bytes:
+        raise ValueError("preflight byte count does not match snapshot-bound GPOs")
 
     by_target: dict[str, list[tuple[GPO, GptAccessObservation]]] = {}
     for target, gpo, observation in resolved:

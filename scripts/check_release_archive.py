@@ -22,6 +22,13 @@ FORBIDDEN_PARTS = {
     "htmlcov",
     "venv",
 }
+FORBIDDEN_CONTENT = (
+    b"GPOWAKE-SENTINEL-" + b"PASSWORD-DO-NOT-LEAK",
+    b"--password-" + b"env",
+    b"--" + b"hashes",
+)
+MAX_ARCHIVE_ENTRY_BYTES = 64 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
 
 
 def _relative_parts(name: str, *, strip_root: bool) -> tuple[str, ...]:
@@ -51,8 +58,17 @@ def _check_name(name: str, *, strip_root: bool, source: bool) -> None:
             raise ValueError(f"unexpected generated egg-info in archive: {name}")
 
 
+def _check_content(name: str, data: bytes) -> None:
+    for forbidden in FORBIDDEN_CONTENT:
+        if forbidden in data:
+            raise ValueError(
+                f"secret sentinel or retired credential interface in archive: {name}"
+            )
+
+
 def inspect_archive(path: Path) -> int:
     count = 0
+    total_size = 0
     if path.name.endswith(".tar.gz"):
         with tarfile.open(path, "r:gz") as archive:
             members = archive.getmembers()
@@ -65,6 +81,16 @@ def inspect_archive(path: Path) -> int:
                         f"special entries are not allowed in the sdist: {member.name}"
                     )
                 _check_name(member.name, strip_root=True, source=True)
+                if member.isfile():
+                    if member.size > MAX_ARCHIVE_ENTRY_BYTES:
+                        raise ValueError(f"oversized archive entry: {member.name}")
+                    total_size += member.size
+                    if total_size > MAX_ARCHIVE_TOTAL_BYTES:
+                        raise ValueError("archive uncompressed-size budget exceeded")
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ValueError(f"could not inspect archive entry: {member.name}")
+                    _check_content(member.name, source.read())
                 count += 1
     elif path.suffix == ".whl":
         with zipfile.ZipFile(path) as archive:
@@ -75,6 +101,13 @@ def inspect_archive(path: Path) -> int:
                         f"links are not allowed in the wheel: {info.filename}"
                     )
                 _check_name(info.filename, strip_root=False, source=False)
+                if not info.is_dir():
+                    if info.file_size > MAX_ARCHIVE_ENTRY_BYTES:
+                        raise ValueError(f"oversized archive entry: {info.filename}")
+                    total_size += info.file_size
+                    if total_size > MAX_ARCHIVE_TOTAL_BYTES:
+                        raise ValueError("archive uncompressed-size budget exceeded")
+                    _check_content(info.filename, archive.read(info))
                 count += 1
     else:
         raise ValueError(f"unsupported release archive type: {path}")

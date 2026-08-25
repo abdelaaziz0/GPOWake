@@ -4,7 +4,7 @@ import struct
 from pathlib import Path
 
 from ..catalog import REGISTRY_CSE_GUID, assess_setting
-from ..models import Setting, SettingKind
+from ..models import Setting, SettingKind, ValueSensitivity
 
 
 REG_SZ = 1
@@ -59,6 +59,18 @@ def _decode_value(reg_type: int, raw: bytes) -> object:
     return raw.hex()
 
 
+def _is_default_password(name: str) -> bool:
+    normalized = name.replace("/", "\\").casefold()
+    for prefix in ("machine\\", "hkey_local_machine\\", "hklm\\"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return (
+        normalized
+        == "software\\microsoft\\windows nt\\currentversion\\winlogon\\defaultpassword"
+    )
+
+
 def parse_registry_pol(data: bytes) -> tuple[Setting, ...]:
     if len(data) < 8 or data[:4] != b"PReg":
         raise ValueError("Registry.pol signature is missing")
@@ -91,12 +103,22 @@ def parse_registry_pol(data: bytes) -> tuple[Setting, ...]:
         raw = data[offset : offset + size]
         offset += size
         offset = _expect(data, offset, b"]\x00")
+        name = f"{key}\\{value_name}"
+        decoded = _decode_value(reg_type, raw)
+        sensitivity = ValueSensitivity.PUBLIC
+        value: object = {"type": reg_type, "data": decoded}
+        if _is_default_password(name) and isinstance(decoded, str) and decoded:
+            # Destruction happens immediately: no model object, snapshot, or
+            # report ever receives the credential bytes or a crackable digest.
+            value = {"type": reg_type, "secret_present": True}
+            sensitivity = ValueSensitivity.SECRET
         settings.append(
             assess_setting(Setting(
                 kind=SettingKind.REGISTRY,
-                name=f"{key}\\{value_name}",
-                value={"type": reg_type, "data": _decode_value(reg_type, raw)},
+                name=name,
+                value=value,
                 required_extension=REGISTRY_CSE_GUID,
+                value_sensitivity=sensitivity,
             ))
         )
     return tuple(settings)

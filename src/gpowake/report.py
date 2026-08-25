@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .models import CoverageGap, Finding
+from .redaction import display_value, redact_sensitive, redact_value
+from .secure_io import secure_write_text
 
 
 def _convert(value: Any) -> Any:
@@ -24,11 +26,20 @@ def _convert(value: Any) -> Any:
 
 def finding_to_dict(finding: Finding) -> dict[str, Any]:
     document = _convert(asdict(finding))
+    document["dormant_value"] = redact_value(
+        finding.dormant_value, finding.value_sensitivity
+    )
+    document["result_value"] = redact_value(
+        finding.result_value, finding.value_sensitivity
+    )
+    document["current_value"] = redact_value(
+        finding.current_value, finding.current_value_sensitivity
+    )
     document["impact"] = {
         "rating": finding.severity.value,
         "score": finding.score,
     }
-    return document
+    return redact_sensitive(document)
 
 
 def coverage_gap_to_dict(gap: CoverageGap) -> dict[str, Any]:
@@ -47,7 +58,7 @@ def report_document(
     collected_at: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_dc": source_dc,
         "ldap_endpoint": ldap_endpoint,
@@ -65,9 +76,9 @@ def report_document(
 
 
 def write_json_report(document: dict[str, Any], path: str | Path | None = None) -> str:
-    rendered = json.dumps(document, indent=2, sort_keys=False) + "\n"
+    rendered = json.dumps(redact_sensitive(document), indent=2, sort_keys=False) + "\n"
     if path:
-        Path(path).write_text(rendered, encoding="utf-8")
+        secure_write_text(path, rendered)
     return rendered
 
 
@@ -132,8 +143,8 @@ def render_finding(finding: Finding) -> str:
         f"Capabilities:    {', '.join(item.value for item in finding.capabilities)}\n"
         f"Dormant GPO:     {finding.gpo_name}\n"
         f"Setting:         {finding.setting_name}\n"
-        f"Dormant value:   {finding.dormant_value}\n"
-        f"Current value:   {finding.current_value}\n"
+        f"Dormant value:   {display_value(finding.dormant_value, finding.value_sensitivity)}\n"
+        f"Current value:   {display_value(finding.current_value, finding.current_value_sensitivity)}\n"
         f"New trustees:    {', '.join(finding.newly_privileged_trustees) or 'N/A'}\n"
         f"Risk rule:       {finding.rule_id or 'explicit snapshot rule'}\n"
         f"Current reason:  {finding.reason.value}\n"
@@ -142,7 +153,8 @@ def render_finding(finding: Finding) -> str:
         f"{alternatives}"
         f"Actions needed:  {len(finding.actions)}\n"
         f"Requires GPO edit: {'Yes' if finding.requires_gpo_edit else 'No'}\n"
-        f"Result:          {finding.setting_name} = {finding.result_value}\n"
+        f"Result:          {finding.setting_name} = "
+        f"{display_value(finding.result_value, finding.value_sensitivity)}\n"
         f"Outcome:         {finding.outcome.value}\n"
         f"Impact:          {finding.severity.value} ({finding.score}/10)\n"
         f"Confidence:      {finding.confidence.value}\n"
@@ -263,7 +275,7 @@ def render_netexec(
         )
         message = (
             f"{finding.principal} -> {finding.setting_name}="
-            f"{_format_value(finding.result_value)} "
+            f"{_format_value(redact_value(finding.result_value, finding.value_sensitivity))} "
             f"via {_path_label(finding.actions)}  "
             f"(outcome={finding.outcome.value}; impact={severity}/{finding.score}; "
             f"confidence={finding.confidence.value}; {finding.reason.value})  "
@@ -294,6 +306,8 @@ def render_netexec(
 
 def render_explanation(finding: dict[str, Any]) -> str:
     """Render the authorization and policy decision tree from report evidence."""
+
+    finding = redact_sensitive(finding)
 
     lines = [
         f"[{finding.get('finding_id')}] {finding.get('outcome', 'POSSIBLE')} candidate",
@@ -369,5 +383,10 @@ def render_explanation(finding: dict[str, Any]) -> str:
                 f"{item.get('source')} {item.get('oracle')}/"
                 f"{item.get('oracle_version')} on {item.get('dc')} at "
                 f"{item.get('observed_at')} snapshot={item.get('snapshot_sha256')}"
+            )
+            lines.append(
+                f"    identity: {item.get('credential_principal')} SID="
+                f"{item.get('authenticated_sid')} "
+                f"attestation={item.get('identity_attestation')}"
             )
     return "\n".join(lines) + "\n"

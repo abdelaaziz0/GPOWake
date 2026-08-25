@@ -20,7 +20,7 @@ It keeps activation separate from ordinary GPO-content weaponization. A finding 
 - Live LDAP/SYSVOL collection pinned to one domain controller (owner and DACL) and offline JSON snapshots.
 - NetExec-style, JSON, JSONL, and verbose-text findings with stable IDs, separately labeled impact and confidence, outcome class, blast radius, alternative paths, ACE/owner authorization evidence, LSDOU traces, versions, `uSNChanged`, endpoint provenance, and GPT hashes. Unresolved gates are emitted separately as structured coverage gaps.
 
-Live automatic danger detection covers **13 computer-side user-right assignments**, both Restricted Groups forms that place unexpected trustees in builtin Administrators, and five exact security/registry states: remote blank-password use, LM-hash retention, disabled UAC, WDigest plaintext credential caching, and a stored AutoLogon password. Other Restricted Groups, security options, and `Registry.pol` values are normalized for evidence/precedence but are not automatically classified. Snapshot settings can explicitly set `dangerous`, `severity`, and `rationale` to extend coverage.
+Live automatic danger detection covers **13 computer-side user-right assignments**, both Restricted Groups forms that place unexpected trustees in builtin Administrators, and five exact security/registry states: remote blank-password use, LM-hash retention, disabled UAC, WDigest plaintext credential caching, and the presence of a stored AutoLogon password. AutoLogon password bytes are destroyed while parsing `Registry.pol`; only a non-reversible `secret_present` marker survives. Other Restricted Groups, security options, and `Registry.pol` values are normalized for evidence/precedence but are not automatically classified. Snapshot settings can explicitly set `dangerous`, `severity`, and `rationale` to extend coverage.
 
 The privilege catalog is per-privilege and delta-aware: reports identify the current value and newly privileged trustees. Domain/Schema/Enterprise Admins are exempted only when their full SID matches the collected domain/forest-root SID; an external group is never trusted merely because its RID ends in `512`, `518`, or `519`.
 
@@ -56,19 +56,18 @@ gpowake explain \
 
 By default `scan` prints NetExec-style, one-line-per-finding output to stdout (`GPOWAKE  <gpo>  <impact>  [?] ... impact=... confidence=...`), with indented `hosts:` and `alt:` continuation lines. `?` means a modeled `POSSIBLE` candidate. `-o/--output` writes to a file instead; `.json` and `.jsonl` select those formats automatically. JSONL begins with a summary and then emits independent warning, coverage-gap, and finding records. `gpowake explain` renders the stored authorization and policy decision tree rather than dumping raw JSON.
 
+Snapshots, reports, and oracle evidence are replaced atomically. POSIX outputs are mode `0600`; native Windows outputs receive a current-user-only ACL before any sensitive content is written. Serialization and every renderer also apply a final fail-closed secret redaction boundary.
+
 ## Live collection and scan
 
-NTLM password authentication:
+NTLM password authentication prompts without echo when no credential source is supplied:
 
 ```bash
-export GPOWAKE_PASSWORD='replace-me'
-
 gpowake scan \
   --domain corp.local \
   --dc-ip 10.0.0.10 \
   --dc-host dc01.corp.local \
   --username auditor \
-  --password-env GPOWAKE_PASSWORD \
   --principal 'helpdesk-ops' \
   --target dc01.corp.local \
   --scope computer \
@@ -99,7 +98,6 @@ gpowake collect \
   --dc-ip 10.0.0.10 \
   --dc-host dc01.corp.local \
   --username auditor \
-  --password-env GPOWAKE_PASSWORD \
   --principal helpdesk-ops \
   --target dc01.corp.local \
   --output corp-snapshot.json
@@ -107,17 +105,19 @@ gpowake collect \
 gpowake scan --snapshot corp-snapshot.json --principal helpdesk-ops --output report.json
 ```
 
+For automation, pass credential JSON through an inherited descriptor (`--credential-fd 3`) or an owner-only regular file (`--credential-file`, mode `0600`). The JSON must contain exactly `{"password":"..."}` or exactly `{"lmhash":"...","nthash":"..."}`. Plaintext command arguments and environment-variable credential sources are not accepted. Native Windows requires a descriptor or interactive prompt because portable strict ACL validation for an input secrets file is unavailable.
+
 Live collection requires at least one exact `--target` (name/DN/SID, repeatable), and applies it in the LDAP filter. Broad collection requires the explicit `--all-targets` acknowledgement. Target security-filter membership is resolved group-first for only the trustees referenced by GPO DACLs; `tokenGroups` is retained only for the small actor set. Unresolved membership is stored by trustee and affects only a DACL that names that trustee. Primary-group SIDs and their recursive parent-group closure are resolved once per distinct primary group under the shared group-query budget; foreign security principals remain unresolved. Unsupported ACE trustees are resolved even when their parsed mask is zero. Use a least-privileged read-only identity.
 
-LDAPS uses `CERT_REQUIRED`, hostname checking, and the system trust store by default. `--ca-file` supplies a private CA bundle; `--tls-no-verify` is an explicit noisy escape hatch. The connected LDAP peer IP must match the IP used for SMB/SYSVOL, otherwise collection is rejected. Cleartext SIMPLE binds are refused unless `--allow-insecure-simple-bind` is supplied. LDAP referrals are disabled, and connection/read timeouts, bounded retries, page size, total LDAP queries, recursive group queries, SMB timeout, and maximum SYSVOL file size are configurable from the CLI.
+LDAPS uses `CERT_REQUIRED`, hostname checking, and the system trust store by default. `--ca-file` supplies a private CA bundle; `--tls-no-verify` is an explicit noisy escape hatch. The connected LDAP peer IP must match the IP used for SMB/SYSVOL, otherwise collection is rejected. Cleartext SIMPLE binds are refused unless `--allow-insecure-simple-bind` is supplied. LDAP referrals are disabled, and connection/read timeouts, bounded retries, page size, total LDAP queries, recursive group queries, SMB timeout, per-file SYSVOL size, aggregate SYSVOL bytes/files, and aggregate probe count are configurable from the CLI.
 
 Collector access to a GPT proves only that the audit identity could read it. It does not prove a computer target can. Live-collected snapshots therefore require target-specific authorization evidence before the solver treats that GPT as applicable; otherwise the report contains a `TARGET_GPT_READ` coverage gap.
 
-GPOWake ships a read-only effective-I/O oracle. Run it within 30 minutes of collection using the selected computer's machine account and NTLM password/hash authentication. Kerberos caches are intentionally not accepted because the resulting session principal cannot yet be independently attested. The oracle reconnects to the exact SMB peer recorded in the snapshot, rejects guest sessions, reads every GPT file whose hash was collected, and refuses drift, missing files, transport errors, wrong credentials, a different DC, or a stale snapshot. Only an actual SMB access-denied status becomes `DENY`:
+GPOWake ships a read-only effective-I/O oracle. Run it within 30 minutes of collection using the selected computer's machine account and NTLM authentication. The snapshot contains the LDAP-collected `sAMAccountName`, object SID, DNS domain, and NetBIOS domain. The oracle requires an exact canonical domain/account match, binds the same credential to LDAP on the pinned DC, resolves that exact computer object, and refuses the session unless its SID matches the snapshot target. Kerberos caches are intentionally not accepted. It then reconnects to the exact SMB peer, rejects guest sessions, explicitly opens each file with `GPT_FILE_GENERIC_READ`, performs bounded streaming reads and incremental SHA-256, continues after per-file denials, and refuses drift, missing files, transport errors, a different DC, or a stale snapshot.
+
+Preflight uses snapshot-bound file sizes and rejects selections above the configured total bytes, files, or probes before authentication/network work. Runtime counters enforce the same limits across the entire selection. A denied `gpt.ini` is a global gate; `GptTmpl.inf` controls privilege rights, Restricted Groups, and security options; `Registry.pol` controls registry settings. Mixed results are `UNKNOWN` only at the aggregate row and remain deterministic per setting family:
 
 ```bash
-export GPOWAKE_MACHINE_PASSWORD='replace-me'
-
 gpowake oracle-gpt-access \
   --snapshot corp-snapshot.json \
   --target SRV1.corp.local \
@@ -126,7 +126,6 @@ gpowake oracle-gpt-access \
   --dc-host dc01.corp.local \
   --username 'SRV1$' \
   --auth-domain CORP \
-  --password-env GPOWAKE_MACHINE_PASSWORD \
   --output gpt-access.json
 
 gpowake import-gpt-access \
@@ -141,16 +140,25 @@ The machine-readable observation schema is strict. An effective-I/O row looks li
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "snapshot_sha256": "<SHA-256 of corp-snapshot.json>",
+  "preflight": {
+    "selected_gpos": 1,
+    "total_files": 2,
+    "total_probes": 2,
+    "total_bytes": 1200,
+    "max_total_files": 10000,
+    "max_total_probes": 10000,
+    "max_total_bytes": 536870912
+  },
   "observations": [
     {
       "target": "S-1-5-21-111-222-333-2100",
       "gpo": "{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}",
-      "decision": "ALLOW",
+      "decision": "UNKNOWN",
       "source": "SMB_EFFECTIVE_IO",
       "oracle": "gpowake-smb-effective-io",
-      "oracle_version": "0.3.0",
+      "oracle_version": "0.4.0",
       "observed_at": "2026-08-25T00:05:00+00:00",
       "desired_access": 1179785,
       "gpt_unc_path": "\\\\dc01.corp.local\\SYSVOL\\corp.local\\Policies\\{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}",
@@ -158,19 +166,22 @@ The machine-readable observation schema is strict. An effective-I/O row looks li
       "target_sid": "S-1-5-21-111-222-333-2100",
       "token_sids_sha256": "<SHA-256 of the canonical snapshot target token>",
       "credential_principal": "CORP\\SRV1$",
+      "authenticated_sid": "S-1-5-21-111-222-333-2100",
+      "identity_attestation": "PINNED_LDAP_BIND_OBJECT_SID",
       "gpo_ad_version": 7,
       "gpt_version": 7,
       "share_sd_sha256": null,
       "ntfs_sd_sha256": null,
       "probes": [
-        {"relative_path": "gpt.ini", "status": "READ_OK", "sha256": "<SHA-256>"}
+        {"relative_path": "gpt.ini", "status": "READ_OK", "sha256": "<SHA-256>", "size": 24},
+        {"relative_path": "Machine\\Registry.pol", "status": "ACCESS_DENIED", "sha256": null, "size": null}
       ]
     }
   ]
 }
 ```
 
-Import revalidates every selector, duplicate, field set, timestamp, snapshot digest, DC, UNC root, target SID, canonical token hash, machine-account principal, AD/GPT version, desired-access mask, and per-file hash. The original source-snapshot digest is retained in each merged observation and surfaced with target/DC/oracle/version/time provenance in findings. `ALLOW` requires every hashed snapshot file; `DENY` requires an `ACCESS_DENIED` probe. Existing target/GPO evidence is not overwritten unless `--replace-existing` is explicit. Local snapshot and evidence files remain inside the operator trust boundary; an operator able to edit both can alter the analysis input.
+Import revalidates every selector, duplicate, field set, timestamp, snapshot digest, aggregate preflight counter, DC, UNC root, expected and authenticated target SID, canonical token hash, exact domain/account, attestation method, AD/GPT version, desired-access mask, and every per-file hash and size. The original source-snapshot digest is retained in each merged observation and surfaced with target/DC/oracle/version/time/identity provenance in findings. Every snapshot-hashed file must have one probe. Existing target/GPO evidence is not overwritten unless `--replace-existing` is explicit. Local snapshot and evidence files remain inside the operator trust boundary; an operator able to edit both can alter the analysis input.
 
 ## Workload controls
 
@@ -200,7 +211,7 @@ The engine recalculates the full effective setting after every proposed transiti
 
 ## Snapshot format
 
-Snapshots and JSON reports use schema version `4` (snapshot schemas 1–3 remain readable; schema 1 receives a migration warning). Pre-schema-4 free-form GPT observations and unstructured live GPT decisions are deliberately discarded on migration and must be recollected with the authenticated oracle. The included [example](examples/same_scope_masked.json) is a complete reference. Important details:
+Snapshots and JSON reports use schema version `5` (snapshot schemas 1–4 remain readable; schema 1 receives a migration warning). Pre-schema-5 GPT observations are deliberately discarded because they did not bind an explicitly requested SMB mask, attested session SID, file sizes, and per-file-family decisions. Unstructured live GPT decisions are also discarded and must be recollected with the hardened oracle. The included [example](examples/same_scope_masked.json) is a complete reference. Important details:
 
 - `gp_link` is preserved in its native ordered string form.
 - `access_mask` accepts a JSON integer or a string such as `"0x00000020"`.
@@ -208,9 +219,12 @@ Snapshots and JSON reports use schema version `4` (snapshot schemas 1–3 remain
 - Omitting a security descriptor means “not collected,” not “allow all.”
 - `machine_extensions: null` means unknown; an empty list means the GPO explicitly advertises no machine CSE.
 - `functionality_version` records `gPCFunctionalityVersion`; live collection rejects values other than the protocol-supported value `2`.
+- `gpt_hashes` and `gpt_file_sizes` bind each collected relative GPT path to the exact bytes used by oracle preflight and drift detection.
+- Live targets retain LDAP-collected `sam_account_name`, `dns_domain`, and `netbios_domain`; the object SID remains the `sid` field.
+- `value_sensitivity: SECRET` values may contain only a destroyed `secret_present` marker; loaders and serializers discard any supplied literal value.
 - A setting may be embedded under `settings`, or loaded from paths relative to the snapshot with `gpt_tmpl_files` and `registry_pol_files`.
 - Record WMI observations under each target's `wmi_results` as `[filter-id, boolean]`; a legacy GPO-global `true` value is not accepted as proof for every host.
-- Imported target GPT authorization is stored under each target's `gpt_read_observations` with structured oracle, target, version, token, DC, UNC, descriptor-hash, and file-probe fields. Legacy `gpt_read_decisions` remain usable only for offline fixtures; they are discarded from live snapshots. `collector_gpt_readable` is separate evidence and never substitutes for target authorization in a live snapshot.
+- Imported target GPT authorization is stored under each target's `gpt_read_observations` with structured oracle, expected/attested SID, exact domain/account, version, token, DC, UNC, descriptor-hash, and per-file probe fields. Legacy `gpt_read_decisions` remain usable only for offline fixtures; they are discarded from live snapshots. `collector_gpt_readable` is separate evidence and never substitutes for target authorization in a live snapshot.
 - `incomplete_setting_kinds` scopes a failed GPT policy file to the setting families it can contain; an empty value on an incomplete legacy GPO remains conservatively unscoped.
 - `unresolved_token_sids` names exact trustees whose membership could not be established. It does not contaminate unrelated DACLs.
 - Boolean fields are strict JSON booleans; strings such as `"false"` are rejected.
@@ -224,6 +238,8 @@ gpowake parse-gpttmpl path/to/GptTmpl.inf
 ## Scope and explicit limitations
 
 This release intentionally supports deterministic computer-side policy only. It does not claim correctness for user policy, loopback, GPP item-level targeting, scripts, software installation, arbitrary WMI evaluation, fake LDAP-hosted GPT paths, or full cross-domain links. Only the explicitly listed Restricted Groups and registry/security states are in the automatic danger catalog; all other normalized values remain evidence/precedence data.
+
+The Linux and native-Windows CI jobs validate the model, parser, secret-sentinel, ACL-output, and fake SMB/LDAP contracts. They are not a substitute for a domain lab. Before promoting findings beyond `POSSIBLE`/`LOW`, the project still requires differential Windows AuthZ/RSoP results across same-name trusted-domain accounts, partial file denial, supported SMB dialects, machine TokenUser identity, and actual Group Policy processing.
 
 If a descriptor, actor token, referenced target group, site, WMI result, target GPT decision, supported policy file, linked GPO, CSE advertisement, or required policy input cannot be resolved, the affected gate is uncertain and no optimistic authorization transition is created. The report emits a structured coverage gap. Collection warnings, AD/GPT version divergence, and unsupported behavior are retained as evidence. LDAP and SMB endpoints, collection time, AD/GPT versions, `uSNChanged`, collector/target SYSVOL readability, and SHA-256 GPT hashes are included in snapshots/reports.
 
@@ -246,14 +262,14 @@ SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD) \
 
 The benchmark has grouped best-case, mixed typical, and per-target adversarial profiles. It checks exact candidate/finding invariants and supports `--max-seconds`, `--max-peak-mib`, solver budgets, dimension overrides, and `--jsonl` results.
 
-`scripts/build_release.sh` refuses a dirty tree, requires `HEAD` to have the exact `v<project-version>` tag, runs the full tests/static gates and all thresholded benchmark profiles, builds from `git archive` in a temporary directory, normalizes source-archive ordering/ownership/modes/timestamps from the commit, rebuilds from that same canonical archive tree for byte-identical verification, and inspects both archives before printing SHA-256 hashes.
+`scripts/build_release.sh` refuses a dirty tree, requires `HEAD` to have an exact, valid SSH-signed `v<project-version>` tag from `maintainers/allowed_signers`, runs the full tests/static/secret-sentinel gates and all thresholded benchmark profiles, builds from `git archive` in a temporary directory, normalizes source-archive ordering/ownership/modes/timestamps from the commit, rebuilds from that same canonical archive tree for byte-identical verification, and inspects both archives before generating deterministic SPDX 2.3 and SLSA/in-toto metadata. CI additionally produces GitHub/Sigstore build-provenance and SBOM attestations for push builds.
 
 The code is split by responsibility:
 
 ```text
 collectors/ldap.py     topology, GPOs, DACLs, referenced-group resolution
 collectors/sysvol.py   DC-pinned GPT collection
-gpt_oracle.py          target-machine authenticated effective SMB probes
+gpt_oracle.py          SID-attested, explicit-access effective SMB probes
 observations.py        strict snapshot-bound GPT evidence import
 parsers/               GptTmpl.inf and Registry.pol
 acl.py                 effective low-level capabilities

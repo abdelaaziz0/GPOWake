@@ -29,10 +29,12 @@ from .models import (
 )
 from .parsers.gpttmpl import parse_gpttmpl_file
 from .parsers.registry_pol import parse_registry_pol_file
+from .redaction import redact_sensitive, redact_value
+from .secure_io import secure_write_text
 
 
-SCHEMA_VERSION = 4
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, SCHEMA_VERSION})
+SCHEMA_VERSION = 5
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, SCHEMA_VERSION})
 MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
 MAX_REFERENCED_POLICY_BYTES = 64 * 1024 * 1024
 MAX_REFERENCED_POLICY_TOTAL_BYTES = 256 * 1024 * 1024
@@ -299,6 +301,10 @@ def load_snapshot(path: str | Path) -> Environment:
                 (str(path), str(digest))
                 for path, digest in item.get("gpt_hashes", [])
             ),
+            gpt_file_sizes=tuple(
+                (str(path), _integer(size))
+                for path, size in item.get("gpt_file_sizes", [])
+            ),
         )
         gpo_key = normalize_dn(gpo.dn)
         if gpo_key in gpos:
@@ -325,6 +331,9 @@ def load_snapshot(path: str | Path) -> Environment:
             sid=item["sid"],
             som_dn=item["som_dn"],
             token_sids=unique_normalized_sids(item.get("token_sids", [])),
+            sam_account_name=item.get("sam_account_name"),
+            dns_domain=item.get("dns_domain"),
+            netbios_domain=item.get("netbios_domain"),
             site_dn=item.get("site_dn"),
             criticality=item.get("criticality", "NORMAL"),
             token_incomplete=_boolean(
@@ -361,6 +370,8 @@ def load_snapshot(path: str | Path) -> Environment:
                     target_sid=str(observation["target_sid"]),
                     token_sids_sha256=str(observation["token_sids_sha256"]),
                     credential_principal=str(observation["credential_principal"]),
+                    authenticated_sid=str(observation["authenticated_sid"]),
+                    identity_attestation=str(observation["identity_attestation"]),
                     gpo_ad_version=_integer(observation["gpo_ad_version"]),
                     gpt_version=_integer(observation["gpt_version"]),
                     share_sd_sha256=(
@@ -382,12 +393,17 @@ def load_snapshot(path: str | Path) -> Environment:
                                 if probe.get("sha256") is not None
                                 else None
                             ),
+                            size=(
+                                _integer(probe["size"])
+                                if probe.get("size") is not None
+                                else None
+                            ),
                         )
                         for probe in observation["probes"]
                     ),
                 )
                 for observation in item.get("gpt_read_observations", [])
-                if source_schema >= 4
+                if source_schema >= 5
             ),
             gpt_read_decisions=tuple(
                 (str(gpo_id), _access_decision(decision))
@@ -430,12 +446,13 @@ def load_snapshot(path: str | Path) -> Environment:
                 )
                 for key, gpo in environment.gpos.items()
             }
-    if source_schema < 4 and any(
+    if source_schema < 5 and any(
         item.get("gpt_read_observations") for item in data.get("targets", [])
     ):
         environment.warnings.append(
-            "pre-schema-4 free-form GPT access observations were discarded; "
-            "rerun the authenticated SMB oracle"
+            "pre-schema-5 GPT access observations were discarded because they did "
+            "not prove the requested SMB mask, session SID, and per-file decisions; "
+            "rerun the hardened SMB oracle"
         )
     if data.get("collected_at") is not None and any(
         item.get("gpt_read_decisions") for item in data.get("targets", [])
@@ -557,13 +574,16 @@ def environment_to_dict(environment: Environment) -> dict[str, Any]:
                     {
                         "kind": setting.kind.value,
                         "name": setting.name,
-                        "value": setting.value,
+                        "value": redact_value(
+                            setting.value, setting.value_sensitivity
+                        ),
                         "dangerous": setting.dangerous,
                         "severity": setting.severity.value,
                         "rationale": setting.rationale,
                         "required_extension": setting.required_extension,
                         "risk_rule_id": setting.risk_rule_id,
                         "unexpected_trustees": setting.unexpected_trustees,
+                        "value_sensitivity": setting.value_sensitivity.value,
                     }
                     for setting in gpo.settings
                 ],
@@ -581,6 +601,7 @@ def environment_to_dict(environment: Environment) -> dict[str, Any]:
                 "gpt_version": gpo.gpt_version,
                 "usn_changed": gpo.usn_changed,
                 "gpt_hashes": gpo.gpt_hashes,
+                "gpt_file_sizes": gpo.gpt_file_sizes,
             }
             for gpo in environment.gpos.values()
         ],
@@ -590,10 +611,14 @@ def environment_to_dict(environment: Environment) -> dict[str, Any]:
 
 
 def save_snapshot(environment: Environment, path: str | Path) -> None:
-    Path(path).write_text(
-        json.dumps(environment_to_dict(environment), indent=2, default=_json_default)
+    secure_write_text(
+        path,
+        json.dumps(
+            redact_sensitive(environment_to_dict(environment)),
+            indent=2,
+            default=_json_default,
+        )
         + "\n",
-        encoding="utf-8",
     )
 
 

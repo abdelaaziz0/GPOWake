@@ -38,7 +38,7 @@ def test_snapshot_round_trip_and_cli_json(tmp_path) -> None:
     save_snapshot(env, snapshot)
     loaded = load_snapshot(snapshot)
     serialized = json.loads(snapshot.read_text())
-    assert serialized["schema_version"] == 4
+    assert serialized["schema_version"] == 5
     assert len(loaded.gpos) == 2
     assert loaded.som(env.targets[0].som_dn).links[0].order == 1
     assert loaded.targets[0].unresolved_token_sids == (
@@ -49,7 +49,7 @@ def test_snapshot_round_trip_and_cli_json(tmp_path) -> None:
     assert main(["scan", "--snapshot", str(snapshot), "--output", str(report)]) == 0
     document = json.loads(report.read_text())
     assert document["finding_count"] >= 1
-    assert document["schema_version"] == 4
+    assert document["schema_version"] == 5
     assert "coverage_gaps" in document
     assert any(item["reason"] == "SAME_SCOPE_MASKED" for item in document["findings"])
 
@@ -98,7 +98,17 @@ def test_import_gpt_access_workflow_unblocks_live_snapshot(tmp_path) -> None:
             ),
             version_number=7,
             gpt_version=7,
-            gpt_hashes=(("gpt.ini", "a" * 64),),
+            gpt_hashes=(
+                ("gpt.ini", "a" * 64),
+                (
+                    "Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf",
+                    "d" * 64,
+                ),
+            ),
+            gpt_file_sizes=(
+                ("gpt.ini", 1),
+                ("Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf", 1),
+            ),
         )
     source = tmp_path / "live.json"
     observations = tmp_path / "gpt-access.json"
@@ -107,8 +117,17 @@ def test_import_gpt_access_workflow_unblocks_live_snapshot(tmp_path) -> None:
     observations.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "snapshot_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "preflight": {
+                    "selected_gpos": 2,
+                    "total_files": 4,
+                    "total_probes": 4,
+                    "total_bytes": 4,
+                    "max_total_files": 10,
+                    "max_total_probes": 10,
+                    "max_total_bytes": 10,
+                },
                 "observations": [
                     {
                         "target": env.targets[0].sid,
@@ -127,6 +146,8 @@ def test_import_gpt_access_workflow_unblocks_live_snapshot(tmp_path) -> None:
                         "target_sid": env.targets[0].sid,
                         "token_sids_sha256": token_sids_sha256(env.targets[0]),
                         "credential_principal": "CORP\\SRV1$",
+                        "authenticated_sid": env.targets[0].sid,
+                        "identity_attestation": "LAB_WINDOWS_TOKEN_USER",
                         "gpo_ad_version": 7,
                         "gpt_version": 7,
                         "share_sd_sha256": "b" * 64,
@@ -136,6 +157,16 @@ def test_import_gpt_access_workflow_unblocks_live_snapshot(tmp_path) -> None:
                                 "relative_path": "gpt.ini",
                                 "status": "READ_OK",
                                 "sha256": "a" * 64,
+                                "size": 1,
+                            },
+                            {
+                                "relative_path": (
+                                    "Machine\\Microsoft\\Windows NT\\SecEdit\\"
+                                    "GptTmpl.inf"
+                                ),
+                                "status": "READ_OK",
+                                "sha256": "d" * 64,
+                                "size": 1,
                             }
                         ],
                     }
@@ -241,6 +272,8 @@ def test_snapshot_rejects_gpt_observation_alias_duplicates(tmp_path) -> None:
                 env.targets[0].sid,
                 token_sids_sha256(env.targets[0]),
                 "CORP\\SRV1$",
+                env.targets[0].sid,
+                "LAB_WINDOWS_TOKEN_USER",
                 7,
                 7,
                 "b" * 64,

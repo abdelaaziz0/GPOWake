@@ -155,6 +155,9 @@ def environment(
                 TARGET,
                 OU_DN,
                 (AUTHENTICATED_USERS,),
+                sam_account_name="SRV1$",
+                dns_domain="corp.local",
+                netbios_domain="CORP",
                 criticality="TIER0",
             )
         ],

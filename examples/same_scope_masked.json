@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "source_dc": "dc01.corp.local",
   "warnings": [],
   "soms": [
@@ -46,7 +46,8 @@
         {
           "kind": "PRIVILEGE_RIGHT",
           "name": "SeDebugPrivilege",
-          "value": ["S-1-5-11"]
+          "value": ["S-1-5-11"],
+          "value_sensitivity": "PUBLIC"
         }
       ]
     },
@@ -66,7 +67,8 @@
         {
           "kind": "PRIVILEGE_RIGHT",
           "name": "SeDebugPrivilege",
-          "value": ["S-1-5-32-544"]
+          "value": ["S-1-5-32-544"],
+          "value_sensitivity": "PUBLIC"
         }
       ]
     }
@@ -85,6 +87,9 @@
       "sid": "S-1-5-21-111-222-333-1001",
       "som_dn": "OU=Domain Controllers,DC=corp,DC=local",
       "token_sids": ["S-1-5-11"],
+      "sam_account_name": "DC01$",
+      "dns_domain": "corp.local",
+      "netbios_domain": "CORP",
       "criticality": "DOMAIN_CONTROLLER"
     },
     {
@@ -93,6 +98,9 @@
       "sid": "S-1-5-21-111-222-333-1002",
       "som_dn": "OU=Domain Controllers,DC=corp,DC=local",
       "token_sids": ["S-1-5-11"],
+      "sam_account_name": "DC02$",
+      "dns_domain": "corp.local",
+      "netbios_domain": "CORP",
       "criticality": "DOMAIN_CONTROLLER"
     }
   ]

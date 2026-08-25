@@ -3,7 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from .models import Setting, SettingKind, Severity, normalize_sid
+from .models import (
+    Setting,
+    SettingKind,
+    Severity,
+    ValueSensitivity,
+    normalize_sid,
+)
 
 
 SECURITY_CSE_GUID = "827d319e-6eac-11d2-a4ea-00c04f79f83a"
@@ -189,15 +195,29 @@ def _assess_security_value(setting: Setting) -> Setting:
         setting.kind is SettingKind.REGISTRY
         and name
         == "software\\microsoft\\windows nt\\currentversion\\winlogon\\defaultpassword"
-        and isinstance(data, str)
-        and bool(data)
+        and (
+            (isinstance(data, str) and bool(data))
+            or (
+                isinstance(setting.value, dict)
+                and setting.value.get("secret_present") is True
+            )
+        )
     ):
         return replace(
             setting,
+            value=(
+                {
+                    "type": setting.value.get("type"),
+                    "secret_present": True,
+                }
+                if isinstance(setting.value, dict)
+                else {"secret_present": True}
+            ),
             dangerous=True,
             severity=Severity.CRITICAL,
             rationale="stores an AutoLogon password in policy-managed registry data",
             risk_rule_id=REGISTRY_SECRET_RULE_ID,
+            value_sensitivity=ValueSensitivity.SECRET,
         )
     if setting.risk_rule_id in {
         SECURITY_BASELINE_RULE_ID,
@@ -297,6 +317,27 @@ def setting_from_dict(data: dict[str, Any]) -> Setting:
     dangerous_value = data.get("dangerous", False)
     if type(dangerous_value) is not bool:
         raise ValueError("Setting.dangerous must be a JSON boolean")
+    sensitivity = ValueSensitivity(data.get("value_sensitivity", "PUBLIC"))
+    normalized_name = _normalized_registry_name(str(data["name"]))
+    if (
+        kind is SettingKind.REGISTRY
+        and normalized_name
+        == "software\\microsoft\\windows nt\\currentversion\\winlogon\\defaultpassword"
+    ):
+        secret_present = False
+        reg_type = None
+        if isinstance(value, dict):
+            reg_type = value.get("type")
+            secret_present = value.get("secret_present") is True or bool(
+                value.get("data")
+            )
+        elif value:
+            secret_present = True
+        if secret_present:
+            value = {"type": reg_type, "secret_present": True}
+            sensitivity = ValueSensitivity.SECRET
+    elif sensitivity is ValueSensitivity.SECRET:
+        value = {"secret_present": True}
     setting = Setting(
         kind=kind,
         name=data["name"],
@@ -307,5 +348,6 @@ def setting_from_dict(data: dict[str, Any]) -> Setting:
         required_extension=required,
         risk_rule_id=data.get("risk_rule_id"),
         unexpected_trustees=tuple(data.get("unexpected_trustees", ())),
+        value_sensitivity=sensitivity,
     )
     return assess_setting(setting)

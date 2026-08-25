@@ -67,3 +67,8 @@ desktop.ini
 /*-snapshot.json
 /snapshot*.json
 /*.report.json
+/credential*.json
+/*-credentials.json
+/*.secrets.json
+/gpt-access*.json
+/*-observations.json

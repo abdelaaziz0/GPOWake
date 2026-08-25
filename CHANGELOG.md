@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.0 - 2026-08-25
+
+- Destroyed non-empty AutoLogon `DefaultPassword` values at the `Registry.pol`
+  parsing and snapshot-import boundaries. Added `ValueSensitivity.SECRET`, a
+  non-reversible presence marker, centralized fail-closed redaction, and a
+  sentinel regression covering snapshots, JSON, JSONL, text, NetExec, and explain.
+- Replaced ordinary output writes with atomic owner-only writes (`0600` on POSIX;
+  current-user-only ACLs on native Windows). Removed password/hash arguments and
+  environment sources in favor of prompts, inherited descriptors, or strict
+  owner-only credential files.
+- Bound machine identity to exact LDAP-collected `sAMAccountName`, object SID,
+  DNS domain, and NetBIOS domain. The SMB oracle now corroborates the same
+  credential through a pinned, signed LDAP bind and exact object-SID lookup.
+- Replaced `getFile()` oracle probes with explicit SMB opens requesting the
+  recorded `GPT_FILE_GENERIC_READ` mask, bounded streaming reads, incremental
+  SHA-256, exact file-size binding, and continued probing after access denial.
+- Made target GPT decisions file-family scoped: `gpt.ini` is the global gate,
+  `GptTmpl.inf` covers security families, and `Registry.pol` covers registry
+  settings. Mixed results no longer deny an entire GPO.
+- Added shared oracle and collector byte/file/probe budgets with preflight
+  estimates, plus exact snapshot file sizes. Suppressed removal-only/empty deltas
+  for both Restricted Groups `Members` and `MemberOf` findings.
+- Bumped snapshots/reports to schema 5 and oracle observations to schema 3;
+  older oracle records are discarded because they did not prove the requested
+  mask, SID attestation, sizes, and per-file decisions.
+- Added native-Windows model CI, Bandit and dependency-audit gates, release
+  secret scanning, SSH-signed tag enforcement with a pinned maintainer key,
+  deterministic SPDX/SLSA metadata, and GitHub/Sigstore provenance/SBOM
+  attestations for push builds.
+
 ## 0.3.0 - 2026-08-25
 
 - Enforced a replay invariant for every claimed target and split target-specific
@@ -40,7 +70,7 @@
 - Fixed undecodable-trustee explicit-ACE dispatch and the solver gate that
   prematurely suppressed opt-in explicit-blocker rewrite paths.
 - Rejected SMB guest sessions and unattestable Kerberos-cache identities, added
-  aggregate snapshot/oracle I/O budgets and an independent transition budget,
+  aggregate snapshot I/O budgets and an independent transition budget,
   and corrected Restricted Groups privilege-delta subtraction.
 - Added Ruff F821, mypy, a Python 3.10-3.13 test matrix, replay regressions, and
   adversarial tests for malformed snapshots and incomplete policy evidence. Added

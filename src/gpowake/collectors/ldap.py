@@ -83,6 +83,9 @@ class CollectionConfig:
     retry_backoff: float = 0.5
     smb_timeout: float = 30.0
     max_sysvol_file_bytes: int = 64 * 1024 * 1024
+    max_sysvol_total_bytes: int = 512 * 1024 * 1024
+    max_sysvol_files: int = 10_000
+    max_sysvol_probes: int = 15_000
 
     def __post_init__(self) -> None:
         positive = {
@@ -93,6 +96,9 @@ class CollectionConfig:
             "max_group_queries": self.max_group_queries,
             "smb_timeout": self.smb_timeout,
             "max_sysvol_file_bytes": self.max_sysvol_file_bytes,
+            "max_sysvol_total_bytes": self.max_sysvol_total_bytes,
+            "max_sysvol_files": self.max_sysvol_files,
+            "max_sysvol_probes": self.max_sysvol_probes,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
@@ -117,6 +123,11 @@ def _parent_dn(dn: str) -> str | None:
             return dn[index + 1 :]
         escaped = False
     return None
+
+
+def _dns_domain_from_dn(dn: str) -> str | None:
+    labels = [part[3:] for part in dn.split(",") if part[:3].casefold() == "dc="]
+    return ".".join(labels) if labels else None
 
 
 def _first(value: Any, default: Any = None) -> Any:
@@ -498,6 +509,27 @@ class LDAPCollector:
             self.warnings.append(f"domain SID was unreadable for {domain_dn}")
         return sid
 
+    def _domain_netbios_name(
+        self, domain_dn: str, configuration_dn: str
+    ) -> str | None:
+        entries = self._search(
+            f"CN=Partitions,{configuration_dn}",
+            "(&(objectClass=crossRef)"
+            f"(nCName={_escape_filter_value(domain_dn)}))",
+            ["nETBIOSName"],
+        )
+        names = {
+            str(_first(entry.get("attributes", {}).get("nETBIOSName"))).strip()
+            for entry in entries
+            if _first(entry.get("attributes", {}).get("nETBIOSName"))
+        }
+        if len(names) != 1:
+            self.warnings.append(
+                f"domain NetBIOS name was not uniquely returned for {domain_dn}"
+            )
+            return None
+        return names.pop()
+
     @staticmethod
     def _descriptor(entry: dict[str, Any]):
         # GPOWake evaluates domainDNS, OU, site and groupPolicyContainer
@@ -754,6 +786,8 @@ class LDAPCollector:
         soms: dict[str, ScopeOfManagement],
         site_names: dict[str, str],
         gpos: dict[str, GPO],
+        dns_domain: str | None,
+        netbios_domain: str | None,
     ) -> list[Target]:
         if not self.config.target_names and not self.config.allow_all_targets:
             raise RuntimeError(
@@ -813,6 +847,14 @@ class LDAPCollector:
                 )
                 continue
             attrs = original["attributes"]
+            sam_account_name = str(
+                _first(attrs.get("sAMAccountName"), "")
+            ).strip() or None
+            if sam_account_name is None:
+                self.warnings.append(
+                    f"target {original['dn']} has no readable sAMAccountName; "
+                    "machine identity cannot be attested"
+                )
             name = str(
                 _first(
                     attrs.get("dNSHostName"),
@@ -862,6 +904,9 @@ class LDAPCollector:
                     sid=sid,
                     som_dn=self._nearest_som(original["dn"], soms, base_dn),
                     token_sids=unique_normalized_sids(sorted(token_sids)),
+                    sam_account_name=sam_account_name,
+                    dns_domain=dns_domain,
+                    netbios_domain=netbios_domain,
                     site_dn=site_dn,
                     criticality="DOMAIN_CONTROLLER" if uac & 0x2000 else "NORMAL",
                     token_incomplete=False,
@@ -1042,7 +1087,16 @@ class LDAPCollector:
         soms, site_names = self._collect_soms(base_dn, configuration_dn)
         gpos = self._collect_gpos(base_dn)
         principals = self._collect_principals(base_dn)
-        targets = self._collect_targets(base_dn, soms, site_names, gpos)
+        dns_domain = _dns_domain_from_dn(base_dn)
+        netbios_domain = self._domain_netbios_name(base_dn, configuration_dn)
+        targets = self._collect_targets(
+            base_dn,
+            soms,
+            site_names,
+            gpos,
+            dns_domain,
+            netbios_domain,
+        )
         domain_sid = self._domain_sid(base_dn)
         forest_root_sid = (
             domain_sid

@@ -1163,7 +1163,10 @@ class CounterfactualSolver:
             GptAccessProvenance(
                 claimed_target.name,
                 claimed_target.sid,
-                observation.decision,
+                observation.authenticated_sid,
+                observation.credential_principal,
+                observation.identity_attestation,
+                observation.decision_for(setting.kind),
                 observation.source,
                 observation.oracle,
                 observation.oracle_version,
@@ -1204,6 +1207,10 @@ class CounterfactualSolver:
             uncertainty_reasons=tuple(dict.fromkeys(uncertainty_reasons)),
             rule_id=setting.risk_rule_id,
             current_value=winner.setting.value if winner else None,
+            value_sensitivity=setting.value_sensitivity,
+            current_value_sensitivity=(
+                winner.setting.value_sensitivity if winner else setting.value_sensitivity
+            ),
             newly_privileged_trustees=newly_privileged,
             target_role=target.criticality,
             current_processing_trace=self._trace(evaluation),
@@ -1213,9 +1220,10 @@ class CounterfactualSolver:
             usn_changed=candidate.usn_changed,
             gpt_hashes=candidate.gpt_hashes,
             sysvol_readable=(
-                target.gpt_read_decision_for(candidate) is AccessDecision.ALLOW
+                target.gpt_read_decision_for(candidate, setting.kind)
+                is AccessDecision.ALLOW
                 or (
-                    target.gpt_read_decision_for(candidate) is None
+                    target.gpt_read_decision_for(candidate, setting.kind) is None
                     and self.environment.collected_at is None
                     and candidate.gpt_readable
                 )
@@ -1292,7 +1300,7 @@ class CounterfactualSolver:
                 "GPO_METADATA",
                 "gPCFunctionalityVersion was not returned during collection",
             )
-        target_gpt_read = target.gpt_read_decision_for(candidate)
+        target_gpt_read = target.gpt_read_decision_for(candidate, setting.kind)
         if target_gpt_read is AccessDecision.UNKNOWN or (
             target_gpt_read is None and self.environment.collected_at is not None
         ):
@@ -1453,7 +1461,11 @@ class CounterfactualSolver:
                         continue
                     newly_privileged = self._newly_privileged(setting, current)
                     if (
-                        setting.kind is SettingKind.PRIVILEGE_RIGHT
+                        setting.kind
+                        in {
+                            SettingKind.PRIVILEGE_RIGHT,
+                            SettingKind.RESTRICTED_GROUP,
+                        }
                         and not newly_privileged
                     ):
                         continue

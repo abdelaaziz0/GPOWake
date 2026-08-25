@@ -11,6 +11,10 @@ from ..parsers.registry_pol import parse_registry_pol
 from .ldap import CollectionConfig
 
 
+class SysvolBudgetExceeded(RuntimeError):
+    pass
+
+
 def _unc_parts(unc: str) -> tuple[str, str]:
     parts = [part for part in unc.replace("/", "\\").split("\\") if part]
     if len(parts) < 3:
@@ -73,21 +77,43 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
             auth.username, auth.password, auth.auth_domain, auth.lmhash, auth.nthash
         )
 
-    def read_file(share: str, path: str) -> bytes:
+    if len(environment.gpos) * 3 > config.max_sysvol_probes:
+        raise SysvolBudgetExceeded(
+            "SYSVOL preflight exceeds the aggregate probe budget; narrow collection "
+            "or raise --max-sysvol-probes"
+        )
+    aggregate_bytes = 0
+    aggregate_files = 0
+    aggregate_probes = 0
+
+    def read_file(share: str, path: str) -> tuple[bytes, str]:
+        nonlocal aggregate_bytes, aggregate_files, aggregate_probes
+        aggregate_probes += 1
+        if aggregate_probes > config.max_sysvol_probes:
+            raise SysvolBudgetExceeded("SYSVOL aggregate probe budget exceeded")
         chunks: list[bytes] = []
         total = 0
+        hasher = hashlib.sha256()
 
         def append_chunk(chunk: bytes) -> None:
-            nonlocal total
+            nonlocal aggregate_bytes, total
             total += len(chunk)
+            aggregate_bytes += len(chunk)
             if total > config.max_sysvol_file_bytes:
-                raise RuntimeError(
+                raise SysvolBudgetExceeded(
                     f"SYSVOL file exceeds {config.max_sysvol_file_bytes} bytes"
                 )
-            chunks.append(chunk)
+            if aggregate_bytes > config.max_sysvol_total_bytes:
+                raise SysvolBudgetExceeded("SYSVOL aggregate byte budget exceeded")
+            data = bytes(chunk)
+            hasher.update(data)
+            chunks.append(data)
 
         smb.getFile(share, path, append_chunk)
-        return b"".join(chunks)
+        aggregate_files += 1
+        if aggregate_files > config.max_sysvol_files:
+            raise SysvolBudgetExceeded("SYSVOL aggregate file budget exceeded")
+        return b"".join(chunks), hasher.hexdigest()
 
     for key, original in list(environment.gpos.items()):
         unc = original.file_sys_path or (
@@ -95,7 +121,9 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
         )
         try:
             share, root = _validated_gpt_location(unc, config, original.guid)
-            gpt_data = read_file(share, root + "\\gpt.ini")
+            gpt_data, gpt_hash = read_file(share, root + "\\gpt.ini")
+        except SysvolBudgetExceeded:
+            raise
         except Exception as exc:
             environment.warnings.append(
                 f"{original.name}: cannot read GPT from {unc}: {exc}"
@@ -113,8 +141,9 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
         settings_uncertainty_reasons: list[str] = []
         incomplete_setting_kinds: list[SettingKind] = []
         hashes: list[tuple[str, str]] = [
-            ("gpt.ini", hashlib.sha256(gpt_data).hexdigest())
+            ("gpt.ini", gpt_hash)
         ]
+        file_sizes: list[tuple[str, int]] = [("gpt.ini", len(gpt_data))]
         paths = (
             (
                 "Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf",
@@ -129,9 +158,12 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
         )
         for relative, parser, setting_kinds in paths:
             try:
-                policy_data = read_file(share, root + "\\" + relative)
-                hashes.append((relative, hashlib.sha256(policy_data).hexdigest()))
+                policy_data, policy_hash = read_file(share, root + "\\" + relative)
+                hashes.append((relative, policy_hash))
+                file_sizes.append((relative, len(policy_data)))
                 settings.extend(parser(policy_data))
+            except SysvolBudgetExceeded:
+                raise
             except Exception as exc:
                 # Missing optional policy files are normal; malformed/read-denied
                 # files are retained as warnings without discarding other CSEs.
@@ -163,6 +195,7 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
             incomplete_setting_kinds=tuple(dict.fromkeys(incomplete_setting_kinds)),
             gpt_version=gpt_version,
             gpt_hashes=tuple(hashes),
+            gpt_file_sizes=tuple(file_sizes),
         )
     try:
         smb.logoff()

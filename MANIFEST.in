@@ -9,3 +9,5 @@ include scripts/check_release_archive.py
 include scripts/build_release.sh
 include scripts/verify_reproducible_build.py
 include scripts/normalize_release_archives.py
+include scripts/generate_release_metadata.py
+include maintainers/allowed_signers

@@ -183,7 +183,7 @@ class PolicyEngine:
                 LinkStatus.UNSUPPORTED,
                 detail=f"unsupported gPCFunctionalityVersion {gpo.functionality_version}",
             )
-        target_gpt_read = target.gpt_read_decision_for(gpo)
+        target_gpt_read = target.gpt_root_read_decision_for(gpo)
         if target_gpt_read is AccessDecision.DENY:
             return LinkEvaluation(som, link, scope_index, LinkStatus.GPT_UNREADABLE)
         if target_gpt_read is AccessDecision.UNKNOWN:
@@ -369,6 +369,24 @@ class PolicyEngine:
                         )
                     )
             for setting in gpo.settings:
+                target_gpt_read = target.gpt_read_decision_for(gpo, setting.kind)
+                if target_gpt_read is AccessDecision.DENY:
+                    continue
+                if target_gpt_read is AccessDecision.UNKNOWN or (
+                    target_gpt_read is None
+                    and self.environment.collected_at is not None
+                ):
+                    uncertainties.append(
+                        PolicyUncertainty(
+                            f"{gpo.name}: target access to the GPT file family for "
+                            f"{setting.kind.value} was not established",
+                            "TARGET_GPT_READ",
+                            gpo_dn=gpo.dn,
+                            setting_keys=(setting.key,),
+                            setting_kinds=(setting.kind,),
+                        )
+                    )
+                    continue
                 extension_uncertain = False
                 if setting.required_extension and gpo.machine_extensions is not None:
                     advertised = {
@@ -418,6 +436,11 @@ class PolicyEngine:
         ]
         if not candidate_links:
             return DormancyReason.UNLINKED, evaluation.winners.get(setting.key)
+        target_gpt_read = evaluation.target.gpt_read_decision_for(
+            candidate, setting.kind
+        )
+        if target_gpt_read is AccessDecision.DENY:
+            return DormancyReason.GPT_UNREADABLE, evaluation.winners.get(setting.key)
         statuses = {item.status for item in candidate_links}
         if LinkStatus.APPLIES not in statuses:
             priority = (

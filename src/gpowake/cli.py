@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -21,6 +23,12 @@ from .report import (
 )
 from .snapshot import load_snapshot, save_snapshot
 from .solver import CounterfactualSolver
+from .secure_io import (
+    read_bounded_fd,
+    read_secure_file,
+    secure_write_lines,
+    secure_write_text,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -28,7 +36,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="gpowake",
         description="Find candidate paths that may activate dormant dangerous GPO settings",
     )
-    parser.add_argument("--version", action="version", version="GPOWake 0.3.0")
+    parser.add_argument("--version", action="version", version="GPOWake 0.4.0")
     commands = parser.add_subparsers(dest="command", required=True)
 
     scan = commands.add_parser("scan", help="analyze a collected JSON snapshot")
@@ -156,16 +164,32 @@ def _parser() -> argparse.ArgumentParser:
     oracle.add_argument("--dc-ip", required=True, help="snapshot DC IP address")
     oracle.add_argument("--dc-host", help="DC hostname/SPN target")
     oracle.add_argument("--username", required=True, help="target machine account (HOST$)")
-    oracle.add_argument("--password", default="", help="password (prefer --password-env)")
-    oracle.add_argument("--password-env", help="read password from this environment variable")
-    oracle.add_argument("--auth-domain", default="", help="NetBIOS authentication domain")
-    oracle.add_argument("--hashes", help="LMHASH:NTHASH for NTLM authentication")
+    oracle.add_argument(
+        "--auth-domain", required=True, help="LDAP-collected NetBIOS domain"
+    )
+    _add_credential_arguments(oracle)
     oracle.add_argument("--smb-timeout", type=float, default=30.0)
     oracle.add_argument(
         "--max-sysvol-file-bytes", type=int, default=64 * 1024 * 1024
     )
     oracle.add_argument("--max-gpos", type=int, default=5_000)
+    oracle.add_argument("--max-total-bytes", type=int, default=512 * 1024 * 1024)
+    oracle.add_argument("--max-total-files", type=int, default=10_000)
+    oracle.add_argument("--max-total-probes", type=int, default=10_000)
     return parser
+
+
+def _add_credential_arguments(parser: argparse.ArgumentParser) -> None:
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument(
+        "--credential-file",
+        help="owner-only 0600 JSON containing password or lmhash/nthash",
+    )
+    sources.add_argument(
+        "--credential-fd",
+        type=int,
+        help="inherited descriptor containing credential JSON",
+    )
 
 
 def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
@@ -181,16 +205,10 @@ def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
         help="disable LDAPS certificate and hostname verification (unsafe)",
     )
     parser.add_argument("--username", default="")
-    parser.add_argument(
-        "--password", default="", help="password (prefer --password-env)"
-    )
-    parser.add_argument(
-        "--password-env", help="read password from this environment variable"
-    )
+    _add_credential_arguments(parser)
     parser.add_argument(
         "--auth-domain", default="", help="NetBIOS authentication domain"
     )
-    parser.add_argument("--hashes", help="LMHASH:NTHASH for NTLM authentication")
     parser.add_argument("--kerberos", action="store_true")
     parser.add_argument("--ccache", help="Kerberos credential cache path")
     parser.add_argument(
@@ -257,6 +275,18 @@ def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
         default=64 * 1024 * 1024,
         help="maximum bytes read from one SYSVOL file (default: 64 MiB)",
     )
+    parser.add_argument(
+        "--max-sysvol-total-bytes",
+        type=int,
+        default=512 * 1024 * 1024,
+        help="aggregate successful SYSVOL bytes (default: 512 MiB)",
+    )
+    parser.add_argument(
+        "--max-sysvol-files", type=int, default=10_000
+    )
+    parser.add_argument(
+        "--max-sysvol-probes", type=int, default=15_000
+    )
 
 
 def _matches(value_set: list[str] | None, *values: str) -> bool:
@@ -264,6 +294,48 @@ def _matches(value_set: list[str] | None, *values: str) -> bool:
         return True
     choices = {value.casefold() for value in values}
     return any(item.casefold() in choices for item in value_set)
+
+
+def _credential_material(
+    args: argparse.Namespace, *, allow_credentialless: bool = False
+) -> tuple[str, str, str]:
+    source: str | None = None
+    if getattr(args, "credential_file", None):
+        source = read_secure_file(args.credential_file)
+    elif getattr(args, "credential_fd", None) is not None:
+        source = read_bounded_fd(args.credential_fd)
+    elif getattr(args, "username", "") and sys.stdin.isatty():
+        return getpass.getpass("Credential password: "), "", ""
+    elif allow_credentialless:
+        return "", "", ""
+    else:
+        raise ValueError(
+            "credentials require an interactive terminal, --credential-fd, or "
+            "an owner-only --credential-file"
+        )
+    try:
+        document = json.loads(source)
+    except json.JSONDecodeError as exc:
+        raise ValueError("credential input must be valid JSON") from exc
+    if not isinstance(document, dict):
+        raise ValueError("credential input must be a JSON object")
+    if set(document) == {"password"}:
+        password = document["password"]
+        if not isinstance(password, str) or not password:
+            raise ValueError("credential password must be a non-empty string")
+        return password, "", ""
+    if set(document) == {"lmhash", "nthash"}:
+        lmhash = document["lmhash"]
+        nthash = document["nthash"]
+        if not all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{32}", value)
+            for value in (lmhash, nthash)
+        ):
+            raise ValueError("credential hashes must each contain 32 hex digits")
+        return "", lmhash, nthash
+    raise ValueError(
+        "credential JSON must contain exactly password or exactly lmhash and nthash"
+    )
 
 
 def _scan(args: argparse.Namespace) -> int:
@@ -307,7 +379,7 @@ def _scan(args: argparse.Namespace) -> int:
     if args.estimate_only:
         rendered = json.dumps(asdict(solver.estimate_work()), indent=2) + "\n"
         if args.output:
-            Path(args.output).write_text(rendered, encoding="utf-8")
+            secure_write_text(args.output, rendered)
         else:
             sys.stdout.write(rendered)
         return 0
@@ -337,10 +409,10 @@ def _scan(args: argparse.Namespace) -> int:
         )
     elif output_format == "jsonl":
         if args.output:
-            with Path(args.output).open("w", encoding="utf-8") as destination:
-                destination.writelines(
-                    iter_jsonl(findings, environment.warnings, solver.coverage_gaps)
-                )
+            secure_write_lines(
+                args.output,
+                iter_jsonl(findings, environment.warnings, solver.coverage_gaps),
+            )
             rendered = ""
         else:
             for line in iter_jsonl(
@@ -363,7 +435,7 @@ def _scan(args: argparse.Namespace) -> int:
                 coverage_gaps=solver.coverage_gaps,
             )
         if args.output:
-            Path(args.output).write_text(rendered, encoding="utf-8")
+            secure_write_text(args.output, rendered)
     if not args.output:
         sys.stdout.write(rendered)
     return 0
@@ -379,19 +451,10 @@ def _collect_environment(args: argparse.Namespace):
             "live collection requires at least one --target; use --all-targets "
             "to acknowledge the cost of broad collection"
         )
-    password = args.password
-    if args.password_env:
-        if args.password_env not in os.environ:
-            raise ValueError(
-                f"password environment variable {args.password_env!r} is not set"
-            )
-        password = os.environ[args.password_env]
-    lmhash = nthash = ""
-    if args.hashes:
-        try:
-            lmhash, nthash = args.hashes.split(":", 1)
-        except ValueError as exc:
-            raise ValueError("--hashes must be LMHASH:NTHASH") from exc
+    password, lmhash, nthash = _credential_material(
+        args,
+        allow_credentialless=(not args.username or (args.kerberos and bool(args.ccache))),
+    )
     if args.ccache:
         os.environ["KRB5CCNAME"] = (
             args.ccache if args.ccache.startswith("FILE:") else f"FILE:{args.ccache}"
@@ -429,6 +492,9 @@ def _collect_environment(args: argparse.Namespace):
         retry_limit=args.ldap_retries,
         smb_timeout=args.smb_timeout,
         max_sysvol_file_bytes=args.max_sysvol_file_bytes,
+        max_sysvol_total_bytes=args.max_sysvol_total_bytes,
+        max_sysvol_files=args.max_sysvol_files,
+        max_sysvol_probes=args.max_sysvol_probes,
     )
     return collect_environment(config)
 
@@ -506,19 +572,7 @@ def _sha256_path(path: Path) -> str:
 def _smb_auth(args: argparse.Namespace):
     from .collectors import AuthConfig
 
-    password = args.password
-    if args.password_env:
-        if args.password_env not in os.environ:
-            raise ValueError(
-                f"password environment variable {args.password_env!r} is not set"
-            )
-        password = os.environ[args.password_env]
-    lmhash = nthash = ""
-    if args.hashes:
-        try:
-            lmhash, nthash = args.hashes.split(":", 1)
-        except ValueError as exc:
-            raise ValueError("--hashes must be LMHASH:NTHASH") from exc
+    password, lmhash, nthash = _credential_material(args)
     return AuthConfig(
         username=args.username,
         password=password,
@@ -549,6 +603,9 @@ def _oracle_gpt_access(args: argparse.Namespace) -> int:
             timeout=args.smb_timeout,
             max_file_bytes=args.max_sysvol_file_bytes,
             max_gpos=args.max_gpos,
+            max_total_bytes=args.max_total_bytes,
+            max_total_files=args.max_total_files,
+            max_total_probes=args.max_total_probes,
         ),
     )
     rendered = json.dumps(document, indent=2) + "\n"
@@ -557,7 +614,7 @@ def _oracle_gpt_access(args: argparse.Namespace) -> int:
             f"oracle output exceeds the {MAX_OBSERVATION_FILE_BYTES}-byte import limit; "
             "select fewer GPOs"
         )
-    Path(args.output).write_text(rendered, encoding="utf-8")
+    secure_write_text(args.output, rendered)
     observation_rows = document.get("observations")
     observation_count = len(observation_rows) if isinstance(observation_rows, list) else 0
     print(
