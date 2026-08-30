@@ -43,6 +43,7 @@ from .models import (
     GptAccessProvenance,
     Link,
     Principal,
+    RegistryOperation,
     ScopeOfManagement,
     SecurityDescriptor,
     Severity,
@@ -1574,6 +1575,23 @@ class CounterfactualSolver:
                                     claimed_target,
                                     candidate,
                                     *target_coverage,
+                                )
+                            continue
+                        if (
+                            setting.kind is SettingKind.REGISTRY
+                            and setting.registry_operation
+                            is RegistryOperation.SET_IF_ABSENT
+                        ):
+                            for member in claimed_targets:
+                                self._record_gap(
+                                    principal,
+                                    member,
+                                    candidate,
+                                    "TARGET_LOCAL_STATE",
+                                    "the dangerous value is written only if absent "
+                                    "(**soft.*); whether it becomes effective "
+                                    "depends on the target's local registry state, "
+                                    "which GPOWake does not collect",
                                 )
                             continue
                         claimed_current = claimed_evaluation.winners.get(setting.key)
