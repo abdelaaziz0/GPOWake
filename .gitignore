@@ -80,7 +80,6 @@ desktop.ini
 # them from being picked up if re-created, but does NOT untrack files git
 # already has in its index -- that needs a separate `git rm --cached` pass.
 # ---------------------------------------------------------------------------
-/README.md
 /CHANGELOG.md
 /LICENSE
 /MANIFEST.in
