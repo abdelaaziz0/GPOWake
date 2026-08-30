@@ -14,9 +14,14 @@ authors = [{name = "GPOWake contributors"}]
 
 [project.optional-dependencies]
 collect = [
-  "ldap3>=2.10.2",
+  "ldap3>=2.10.2rc4,<2.11",
   "impacket>=0.12",
+]
+kerberos = [
   "gssapi>=1.8; sys_platform != 'win32'",
+]
+pkinit = [
+  "minikerberos>=0.4.9,<0.5",
 ]
 dev = [
   "bandit>=1.9.4",

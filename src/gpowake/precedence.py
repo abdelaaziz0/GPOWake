@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from .acl import evaluate_apply_gpo, evaluate_read_gpo
@@ -10,9 +10,11 @@ from .models import (
     Environment,
     GPO,
     Link,
+    RegistryOperation,
     ScopeOfManagement,
     Setting,
     SettingKind,
+    SomKind,
     Target,
     normalize_dn,
 )
@@ -75,6 +77,13 @@ class Evaluation:
     links: tuple[LinkEvaluation, ...]
     processing_order: tuple[LinkEvaluation, ...]
     winners: dict[tuple[str, str], EffectiveSetting]
+    # Restricted Groups "Member Of" is inclusion-only. Retain each effective
+    # contributor as well as the merged value so the solver can prove that a
+    # specific dormant GPO became effective without pretending there is one
+    # last-writer winner.
+    additive_contributors: dict[
+        tuple[str, str], tuple[EffectiveSetting, ...]
+    ]
     uncertainties: tuple[PolicyUncertainty, ...] = ()
 
     @property
@@ -97,6 +106,43 @@ class PolicyEngine:
 
     def __init__(self, environment: Environment):
         self.environment = environment
+
+    def _site_resolution_uncertainty(
+        self, target: Target
+    ) -> PolicyUncertainty | None:
+        """Scope an unknown site only to policy that a site could contribute."""
+
+        if not target.site_resolution_error:
+            return None
+        setting_keys: set[tuple[str, str]] = set()
+        setting_kinds: set[SettingKind] = set()
+        unscoped = False
+        for som in self.environment.soms.values():
+            if som.kind is not SomKind.SITE:
+                continue
+            for link in som.links:
+                if link.disabled:
+                    continue
+                gpo = self.environment.gpo(link.gpo_dn)
+                if gpo is None:
+                    unscoped = True
+                    continue
+                setting_keys.update(setting.key for setting in gpo.settings)
+                if not gpo.settings_complete:
+                    if gpo.incomplete_setting_kinds:
+                        setting_kinds.update(gpo.incomplete_setting_kinds)
+                    else:
+                        unscoped = True
+        if unscoped:
+            return PolicyUncertainty(target.site_resolution_error, "SITE_RESOLUTION")
+        if not setting_keys and not setting_kinds:
+            return None
+        return PolicyUncertainty(
+            target.site_resolution_error,
+            "SITE_RESOLUTION",
+            setting_keys=tuple(sorted(setting_keys)),
+            setting_kinds=tuple(sorted(setting_kinds, key=lambda item: item.value)),
+        )
 
     def som_chain(self, target: Target) -> tuple[ScopeOfManagement, ...]:
         chain: list[ScopeOfManagement] = []
@@ -284,6 +330,13 @@ class PolicyEngine:
         )
 
     @staticmethod
+    def is_restricted_member_of(setting: Setting) -> bool:
+        if setting.kind is not SettingKind.RESTRICTED_GROUP:
+            return False
+        _group, separator, relationship = setting.name.partition("/")
+        return bool(separator) and relationship.casefold() == "memberof"
+
+    @staticmethod
     def _processing_key(item: LinkEvaluation) -> tuple[int, int, int]:
         # Normal links: site/domain/OU from broad to specific, and high numeric
         # link order first so order 1 is processed last. Enforced links are then
@@ -291,6 +344,48 @@ class PolicyEngine:
         if item.link.enforced:
             return 1, -item.scope_index, -item.link.order
         return 0, item.scope_index, -item.link.order
+
+    @staticmethod
+    def _registry_key(setting: Setting) -> str:
+        key = setting.registry_key
+        if key is None:
+            key = setting.name.rsplit("\\", 1)[0] if "\\" in setting.name else ""
+        return key.replace("/", "\\").rstrip("\\").casefold()
+
+    @classmethod
+    def _apply_registry_operation(
+        cls,
+        winners: dict[tuple[str, str], EffectiveSetting],
+        setting: Setting,
+        effective: EffectiveSetting,
+    ) -> None:
+        operation = setting.registry_operation or RegistryOperation.SET_VALUE
+        if operation is RegistryOperation.SET_VALUE:
+            winners[setting.key] = effective
+            return
+        if operation is RegistryOperation.SET_IF_ABSENT:
+            winners.setdefault(setting.key, effective)
+            return
+        if operation is RegistryOperation.DELETE_VALUE:
+            winners.pop(setting.key, None)
+            return
+        if operation is RegistryOperation.SECURE_KEY:
+            # **SecureKey changes the registry key ACL, not effective value data.
+            return
+
+        target_key = cls._registry_key(setting)
+        for winner_key, current in tuple(winners.items()):
+            if current.setting.kind is not SettingKind.REGISTRY:
+                continue
+            current_key = cls._registry_key(current.setting)
+            if operation is RegistryOperation.DELETE_ALL_VALUES:
+                remove = current_key == target_key
+            else:
+                remove = current_key == target_key or current_key.startswith(
+                    target_key + "\\"
+                )
+            if remove:
+                winners.pop(winner_key, None)
 
     def evaluate(self, target: Target) -> Evaluation:
         chain = self.som_chain(target)
@@ -306,11 +401,13 @@ class PolicyEngine:
             )
         )
         winners: dict[tuple[str, str], EffectiveSetting] = {}
+        additive_contributors: dict[
+            tuple[str, str], list[EffectiveSetting]
+        ] = {}
         uncertainties: list[PolicyUncertainty] = []
-        if target.site_resolution_error:
-            uncertainties.append(
-                PolicyUncertainty(target.site_resolution_error, "SITE_RESOLUTION")
-            )
+        site_uncertainty = self._site_resolution_uncertainty(target)
+        if site_uncertainty is not None:
+            uncertainties.append(site_uncertainty)
         for item in links:
             if not item.uncertain or not item.detail:
                 continue
@@ -408,18 +505,49 @@ class PolicyEngine:
                             setting_keys=(setting.key,),
                         )
                     )
-                winners[setting.key] = EffectiveSetting(
+                effective = EffectiveSetting(
                     setting=setting,
                     gpo=gpo,
                     application=application,
                     uncertain=application.uncertain or extension_uncertain,
                 )
+                if setting.kind is SettingKind.REGISTRY:
+                    self._apply_registry_operation(winners, setting, effective)
+                elif self.is_restricted_member_of(setting):
+                    contributors = additive_contributors.setdefault(setting.key, [])
+                    contributors.append(effective)
+                    current = winners.get(setting.key)
+                    if current is None:
+                        winners[setting.key] = effective
+                    else:
+                        current_values = (
+                            current.setting.value
+                            if isinstance(current.setting.value, (list, tuple, set))
+                            else ()
+                        )
+                        new_values = (
+                            setting.value
+                            if isinstance(setting.value, (list, tuple, set))
+                            else ()
+                        )
+                        merged = tuple(dict.fromkeys((*current_values, *new_values)))
+                        winners[setting.key] = replace(
+                            effective,
+                            setting=replace(setting, value=merged),
+                            uncertain=current.uncertain or effective.uncertain,
+                        )
+                else:
+                    winners[setting.key] = effective
         return Evaluation(
             target,
             chain,
             links,
             processing,
             winners,
+            {
+                key: tuple(contributors)
+                for key, contributors in additive_contributors.items()
+            },
             tuple(dict.fromkeys(uncertainties)),
         )
 

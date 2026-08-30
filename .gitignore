@@ -72,3 +72,21 @@ desktop.ini
 /*.secrets.json
 /gpt-access*.json
 /*-observations.json
+
+# ---------------------------------------------------------------------------
+# Non-essential to running the tool: docs, versioning/release machinery,
+# benchmarks, maintainer metadata. Kept on disk, just never pushed.
+# NOTE: these paths are currently tracked by git. Being listed here stops
+# them from being picked up if re-created, but does NOT untrack files git
+# already has in its index -- that needs a separate `git rm --cached` pass.
+# ---------------------------------------------------------------------------
+/README.md
+/CHANGELOG.md
+/LICENSE
+/MANIFEST.in
+/.gitattributes
+/.github/
+/benchmarks/
+/maintainers/
+/tests/
+/scripts/

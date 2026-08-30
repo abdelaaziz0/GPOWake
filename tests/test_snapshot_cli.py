@@ -38,7 +38,7 @@ def test_snapshot_round_trip_and_cli_json(tmp_path) -> None:
     save_snapshot(env, snapshot)
     loaded = load_snapshot(snapshot)
     serialized = json.loads(snapshot.read_text())
-    assert serialized["schema_version"] == 5
+    assert serialized["schema_version"] == 6
     assert len(loaded.gpos) == 2
     assert loaded.som(env.targets[0].som_dn).links[0].order == 1
     assert loaded.targets[0].unresolved_token_sids == (
@@ -117,7 +117,7 @@ def test_import_gpt_access_workflow_unblocks_live_snapshot(tmp_path) -> None:
     observations.write_text(
         json.dumps(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "snapshot_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                 "preflight": {
                     "selected_gpos": 2,

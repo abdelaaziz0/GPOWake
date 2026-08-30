@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from .solver import CounterfactualSolver
 from .secure_io import (
     read_bounded_fd,
     read_secure_file,
+    scoped_credential_cache,
+    scoped_kerberos_config,
     secure_write_lines,
     secure_write_text,
 )
@@ -137,7 +140,13 @@ def _parser() -> argparse.ArgumentParser:
         help="merge target-specific Windows/SMB GPT access observations",
     )
     import_access.add_argument("--snapshot", required=True)
-    import_access.add_argument("--observations", required=True)
+    import_access.add_argument(
+        "--observations",
+        required=True,
+        action="append",
+        metavar="PATH",
+        help="observation JSON path (repeatable; all bind to the input snapshot)",
+    )
     import_access.add_argument("--output", "-o", required=True)
     import_access.add_argument(
         "--replace-existing",
@@ -190,6 +199,11 @@ def _add_credential_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         help="inherited descriptor containing credential JSON",
     )
+    sources.add_argument(
+        "--prompt-hash",
+        action="store_true",
+        help="prompt without echo for an NT hash (optional LM hash follows)",
+    )
 
 
 def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
@@ -211,6 +225,10 @@ def _add_collection_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--kerberos", action="store_true")
     parser.add_argument("--ccache", help="Kerberos credential cache path")
+    parser.add_argument(
+        "--pfx",
+        help="owner-only PFX/P12 credential used for PKINIT (implies Kerberos)",
+    )
     parser.add_argument(
         "--allow-insecure-simple-bind",
         action="store_true",
@@ -304,6 +322,16 @@ def _credential_material(
         source = read_secure_file(args.credential_file)
     elif getattr(args, "credential_fd", None) is not None:
         source = read_bounded_fd(args.credential_fd)
+    elif getattr(args, "prompt_hash", False):
+        if not sys.stdin.isatty():
+            raise ValueError("--prompt-hash requires an interactive terminal")
+        nthash = getpass.getpass("NT hash: ")
+        lmhash = getpass.getpass(
+            "LM hash (leave blank for the standard empty LM hash): "
+        ) or "aad3b435b51404eeaad3b435b51404ee"
+        if not all(re.fullmatch(r"[0-9a-fA-F]{32}", value) for value in (lmhash, nthash)):
+            raise ValueError("credential hashes must each contain 32 hex digits")
+        return "", lmhash, nthash
     elif getattr(args, "username", "") and sys.stdin.isatty():
         return getpass.getpass("Credential password: "), "", ""
     elif allow_credentialless:
@@ -336,6 +364,30 @@ def _credential_material(
     raise ValueError(
         "credential JSON must contain exactly password or exactly lmhash and nthash"
     )
+
+
+def _pfx_password(args: argparse.Namespace) -> str:
+    source: str | None = None
+    if getattr(args, "credential_file", None):
+        source = read_secure_file(args.credential_file)
+    elif getattr(args, "credential_fd", None) is not None:
+        source = read_bounded_fd(args.credential_fd)
+    elif sys.stdin.isatty():
+        return getpass.getpass("PFX password (leave blank if unencrypted): ")
+    else:
+        return ""
+    try:
+        document = json.loads(source)
+    except json.JSONDecodeError as exc:
+        raise ValueError("credential input must be valid JSON") from exc
+    if not isinstance(document, dict) or set(document) != {"pfx_password"}:
+        raise ValueError(
+            "PFX credential JSON must contain exactly pfx_password"
+        )
+    password = document["pfx_password"]
+    if not isinstance(password, str):
+        raise ValueError("pfx_password must be a JSON string")
+    return password
 
 
 def _scan(args: argparse.Namespace) -> int:
@@ -451,52 +503,101 @@ def _collect_environment(args: argparse.Namespace):
             "live collection requires at least one --target; use --all-targets "
             "to acknowledge the cost of broad collection"
         )
-    password, lmhash, nthash = _credential_material(
-        args,
-        allow_credentialless=(not args.username or (args.kerberos and bool(args.ccache))),
-    )
-    if args.ccache:
-        os.environ["KRB5CCNAME"] = (
-            args.ccache if args.ccache.startswith("FILE:") else f"FILE:{args.ccache}"
+    if args.ccache and not args.kerberos:
+        raise ValueError("--ccache requires --kerberos")
+    if args.pfx and (args.kerberos or args.ccache):
+        raise ValueError("--pfx is a Kerberos credential source and cannot be combined with --kerberos or --ccache")
+    if args.pfx and not args.username:
+        raise ValueError("--pfx requires an explicit --username")
+    if args.pfx and not args.dc_host:
+        raise ValueError("--pfx requires --dc-host for Kerberos SPN binding")
+    if args.ccache and (
+        getattr(args, "credential_file", None)
+        or getattr(args, "credential_fd", None) is not None
+        or getattr(args, "prompt_hash", False)
+    ):
+        raise ValueError("--ccache cannot be combined with another credential source")
+    if args.kerberos and getattr(args, "prompt_hash", False):
+        raise ValueError(
+            "--prompt-hash selects NTLM pass-the-hash and cannot be combined "
+            "with --kerberos"
         )
-    auth = AuthConfig(
-        username=args.username,
-        password=password,
-        auth_domain=args.auth_domain or args.domain.split(".", 1)[0].upper(),
-        lmhash=lmhash,
-        nthash=nthash,
-        kerberos=args.kerberos,
-        ccache=args.ccache,
-        allow_insecure_simple_bind=getattr(
-            args, "allow_insecure_simple_bind", False
-        ),
-    )
-    config = CollectionConfig(
-        domain=args.domain,
-        dc_ip=args.dc_ip,
-        dc_host=args.dc_host,
-        ldap_uri=args.ldap_uri,
-        principals=tuple(args.principal or ()),
-        target_filter=args.target_filter,
-        target_names=tuple(getattr(args, "target", None) or ()),
-        auth=auth,
-        collect_sysvol=not args.no_sysvol,
-        ca_file=args.ca_file,
-        tls_no_verify=args.tls_no_verify,
-        allow_all_targets=args.all_targets,
-        connect_timeout=args.connect_timeout,
-        receive_timeout=args.receive_timeout,
-        ldap_page_size=args.ldap_page_size,
-        max_ldap_queries=args.max_ldap_queries,
-        max_group_queries=args.max_group_queries,
-        retry_limit=args.ldap_retries,
-        smb_timeout=args.smb_timeout,
-        max_sysvol_file_bytes=args.max_sysvol_file_bytes,
-        max_sysvol_total_bytes=args.max_sysvol_total_bytes,
-        max_sysvol_files=args.max_sysvol_files,
-        max_sysvol_probes=args.max_sysvol_probes,
-    )
-    return collect_environment(config)
+    if getattr(args, "prompt_hash", False) and not args.username:
+        raise ValueError("--prompt-hash requires --username")
+    if args.pfx and getattr(args, "prompt_hash", False):
+        raise ValueError("--pfx cannot be combined with --prompt-hash")
+    cache_scope: AbstractContextManager[str | None]
+    if args.pfx:
+        pfx_password = _pfx_password(args)
+        password, lmhash, nthash = "", "", ""
+    else:
+        pfx_password = ""
+        password, lmhash, nthash = _credential_material(
+            args,
+            allow_credentialless=(
+                not args.username or (args.kerberos and bool(args.ccache))
+            ),
+        )
+    if args.pfx:
+        from .pkinit import pkinit_credential_cache
+
+        cache_scope = pkinit_credential_cache(
+            pfx_path=args.pfx,
+            pfx_password=pfx_password,
+            username=args.username,
+            domain=args.domain,
+            dc_ip=args.dc_ip,
+            dc_host=args.dc_host,
+            timeout=args.connect_timeout,
+        )
+    elif args.ccache:
+        cache_scope = scoped_credential_cache(args.ccache)
+    else:
+        cache_scope = nullcontext()
+    kerberos_scope: AbstractContextManager[str | None]
+    if args.kerberos or args.pfx:
+        kerberos_scope = scoped_kerberos_config(args.domain, args.dc_ip)
+    else:
+        kerberos_scope = nullcontext()
+    with kerberos_scope, cache_scope:
+        auth = AuthConfig(
+            username=args.username,
+            password=password,
+            auth_domain=args.auth_domain or args.domain.split(".", 1)[0].upper(),
+            lmhash=lmhash,
+            nthash=nthash,
+            kerberos=args.kerberos or bool(args.pfx),
+            ccache=args.ccache,
+            allow_insecure_simple_bind=getattr(
+                args, "allow_insecure_simple_bind", False
+            ),
+        )
+        config = CollectionConfig(
+            domain=args.domain,
+            dc_ip=args.dc_ip,
+            dc_host=args.dc_host,
+            ldap_uri=args.ldap_uri,
+            principals=tuple(args.principal or ()),
+            target_filter=args.target_filter,
+            target_names=tuple(getattr(args, "target", None) or ()),
+            auth=auth,
+            collect_sysvol=not args.no_sysvol,
+            ca_file=args.ca_file,
+            tls_no_verify=args.tls_no_verify,
+            allow_all_targets=args.all_targets,
+            connect_timeout=args.connect_timeout,
+            receive_timeout=args.receive_timeout,
+            ldap_page_size=args.ldap_page_size,
+            max_ldap_queries=args.max_ldap_queries,
+            max_group_queries=args.max_group_queries,
+            retry_limit=args.ldap_retries,
+            smb_timeout=args.smb_timeout,
+            max_sysvol_file_bytes=args.max_sysvol_file_bytes,
+            max_sysvol_total_bytes=args.max_sysvol_total_bytes,
+            max_sysvol_files=args.max_sysvol_files,
+            max_sysvol_probes=args.max_sysvol_probes,
+        )
+        return collect_environment(config)
 
 
 def _collect(args: argparse.Namespace) -> int:
@@ -550,12 +651,18 @@ def _import_gpt_access(args: argparse.Namespace) -> int:
     with snapshot_path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             hasher.update(chunk)
-    count = import_gpt_access_observations(
-        environment,
-        args.observations,
-        snapshot_sha256=hasher.hexdigest(),
-        replace_existing=args.replace_existing,
-    )
+    source_digest = hasher.hexdigest()
+    count = 0
+    # Every document is intentionally checked against the same pristine input
+    # digest. Saving happens only after all imports succeed, so a bad later
+    # document cannot leave a partially merged output snapshot.
+    for observation_path in args.observations:
+        count += import_gpt_access_observations(
+            environment,
+            observation_path,
+            snapshot_sha256=source_digest,
+            replace_existing=args.replace_existing,
+        )
     save_snapshot(environment, args.output)
     print(f"Imported {count} GPT access observation(s) into {args.output}")
     return 0

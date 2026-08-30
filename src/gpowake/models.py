@@ -39,6 +39,17 @@ class SettingKind(str, Enum):
     REGISTRY = "REGISTRY"
 
 
+class RegistryOperation(str, Enum):
+    """One ordered MS-GPREG Registry.pol instruction."""
+
+    SET_VALUE = "SET_VALUE"
+    SET_IF_ABSENT = "SET_IF_ABSENT"
+    DELETE_VALUE = "DELETE_VALUE"
+    DELETE_ALL_VALUES = "DELETE_ALL_VALUES"
+    DELETE_KEY = "DELETE_KEY"
+    SECURE_KEY = "SECURE_KEY"
+
+
 class ValueSensitivity(str, Enum):
     """How a setting value may be retained or rendered."""
 
@@ -224,6 +235,42 @@ class Setting:
     # SECRET values are destroyed at ingestion and may only be represented by
     # a presence marker. Serializers and renderers enforce this again.
     value_sensitivity: ValueSensitivity = ValueSensitivity.PUBLIC
+    # Registry.pol is an ordered operation stream. These fields retain the
+    # semantic target separately from the raw instruction spelling so delete,
+    # set-if-absent, and key operations can be replayed correctly.
+    registry_operation: RegistryOperation | None = None
+    registry_key: str | None = None
+    registry_value_name: str | None = None
+
+    def __post_init__(self) -> None:
+        registry_fields = (
+            self.registry_operation,
+            self.registry_key,
+            self.registry_value_name,
+        )
+        if self.kind is not SettingKind.REGISTRY and any(
+            item is not None for item in registry_fields
+        ):
+            raise ValueError("registry operation metadata requires a REGISTRY setting")
+        if self.registry_operation is None:
+            return
+        if self.registry_key is None or not self.registry_key.strip():
+            raise ValueError("registry operation requires a non-empty registry key")
+        value_operations = {
+            RegistryOperation.SET_VALUE,
+            RegistryOperation.SET_IF_ABSENT,
+            RegistryOperation.DELETE_VALUE,
+        }
+        if (
+            self.registry_operation in value_operations
+            and self.registry_value_name is None
+        ):
+            raise ValueError("registry value operation requires a value name")
+        if (
+            self.registry_operation not in value_operations
+            and self.registry_value_name is not None
+        ):
+            raise ValueError("registry key operation cannot carry a value name")
 
     @property
     def key(self) -> tuple[str, str]:

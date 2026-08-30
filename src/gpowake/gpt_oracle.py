@@ -8,7 +8,14 @@ from typing import Any, Iterable
 
 from . import __version__
 from .collectors import AuthConfig
-from .models import AccessDecision, Environment, GPO, GptAccessProbe, Target
+from .models import (
+    AccessDecision,
+    Environment,
+    GPO,
+    GptAccessProbe,
+    Target,
+    normalize_sid,
+)
 from .observations import (
     GPT_FILE_GENERIC_READ,
     OBSERVATION_SCHEMA_VERSION,
@@ -201,10 +208,12 @@ def _attest_machine_sid(
     target: Target,
     config: SmbOracleConfig,
 ) -> str:
-    """Bind to the pinned DC with the SMB credentials and resolve the exact object SID."""
+    """Attest the exact machine object and authorization token on the pinned DC."""
 
     if not target.dns_domain or not target.sam_account_name or not target.netbios_domain:
         raise ValueError("snapshot target lacks exact LDAP machine identity fields")
+    if target.token_incomplete or target.unresolved_sids:
+        raise ValueError("snapshot target token is incomplete and cannot be attested")
     try:
         from impacket.ldap import ldap  # type: ignore[import-not-found]
         from impacket.ldap.ldapasn1 import (  # type: ignore[import-not-found]
@@ -239,30 +248,55 @@ def _attest_machine_sid(
             sizeLimit=1,
             timeLimit=max(1, int(config.timeout)),
             searchFilter="(objectClass=computer)",
-            attributes=["objectSid", "sAMAccountName", "dNSHostName"],
+            attributes=[
+                "objectSid",
+                "sAMAccountName",
+                "dNSHostName",
+                "sIDHistory",
+                "tokenGroups",
+            ],
         )
         entries = [row for row in rows if isinstance(row, SearchResultEntry)]
         if len(entries) != 1:
             raise RuntimeError("pinned LDAP attestation did not return the target object")
-        attributes: dict[str, bytes] = {}
+        attributes: dict[str, list[bytes]] = {}
         for attribute in entries[0]["attributes"]:
             values = attribute["vals"]
-            if len(values):
-                attributes[str(attribute["type"]).casefold()] = values[0].asOctets()
-        sam = attributes.get("samaccountname", b"").decode("utf-8", errors="strict")
+            attributes[str(attribute["type"]).casefold()] = [
+                value.asOctets() for value in values
+            ]
+        sam_values = attributes.get("samaccountname", [])
+        sam = (sam_values[0] if sam_values else b"").decode(
+            "utf-8", errors="strict"
+        )
         if sam.casefold() != target.sam_account_name.casefold():
             raise RuntimeError("pinned LDAP sAMAccountName does not match the snapshot")
-        raw_sid = attributes.get("objectsid")
-        if not raw_sid:
+        object_sid_values = attributes.get("objectsid", [])
+        if len(object_sid_values) != 1:
             raise RuntimeError("pinned LDAP target object did not return objectSid")
-        sid = LDAP_SID(data=raw_sid).formatCanonical()
+        sid = LDAP_SID(data=object_sid_values[0]).formatCanonical()
         if sid.casefold() != target.sid.casefold():
             raise RuntimeError("pinned LDAP object SID does not match the snapshot target")
-        dns_name = attributes.get("dnshostname", b"").decode(
+        dns_values = attributes.get("dnshostname", [])
+        dns_name = (dns_values[0] if dns_values else b"").decode(
             "utf-8", errors="strict"
         )
         if "." in target.name and dns_name.casefold() != target.name.casefold():
             raise RuntimeError("pinned LDAP dNSHostName does not match the snapshot")
+        attested_token = {
+            normalize_sid("S-1-1-0"),
+            normalize_sid("S-1-5-11"),
+            normalize_sid(sid),
+        }
+        for name in ("sidhistory", "tokengroups"):
+            for raw_group_sid in attributes.get(name, []):
+                attested_token.add(
+                    normalize_sid(LDAP_SID(data=raw_group_sid).formatCanonical())
+                )
+        if frozenset(attested_token) != target.all_sids:
+            raise RuntimeError(
+                "pinned LDAP tokenGroups/sIDHistory do not match the snapshot token"
+            )
         return sid
     finally:
         connection.close()

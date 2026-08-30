@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from gpowake.models import SettingKind, Severity
+from gpowake.models import RegistryOperation, SettingKind, Severity
 from gpowake.parsers.gpttmpl import parse_gpttmpl
 from gpowake.parsers.registry_pol import parse_registry_pol
 
@@ -56,6 +56,20 @@ def _wide(value: str) -> bytes:
     return value.encode("utf-16-le")
 
 
+def _registry_record(key: str, name: str, reg_type: int, raw: bytes) -> bytes:
+    return (
+        _wide("[")
+        + _wide(f"{key};")
+        + _wide(f"{name};")
+        + struct.pack("<I", reg_type)
+        + _wide(";")
+        + struct.pack("<I", len(raw))
+        + _wide(";")
+        + raw
+        + _wide("]")
+    )
+
+
 def test_registry_pol_single_dword() -> None:
     data = b"PReg" + struct.pack("<I", 1)
     data += _wide("[") + _wide("Software\\Policies\\Example;") + _wide("Enabled;")
@@ -64,6 +78,49 @@ def test_registry_pol_single_dword() -> None:
     settings = parse_registry_pol(data)
     assert settings[0].name == "Software\\Policies\\Example\\Enabled"
     assert settings[0].value == {"type": 4, "data": 1}
+    assert settings[0].registry_operation is RegistryOperation.SET_VALUE
+
+
+def test_registry_pol_special_instructions_are_semantic_operations() -> None:
+    key = "Software\\Policies\\Example"
+    text = lambda value: _wide(value + "\x00")
+    data = b"PReg" + struct.pack("<I", 1)
+    data += _registry_record(key, "**DeleteValues", 1, text("One;Two"))
+    data += _registry_record(key, "**Del.Three", 1, text(" "))
+    data += _registry_record(key, "**DelVals.", 1, text(" "))
+    data += _registry_record(key, "**DeleteKeys", 1, text("Child;Other"))
+    data += _registry_record(key, "**SecureKey", 4, struct.pack("<I", 1))
+    data += _registry_record(key, "**soft.Enabled", 4, struct.pack("<I", 1))
+
+    settings = parse_registry_pol(data)
+    assert [item.registry_operation for item in settings] == [
+        RegistryOperation.DELETE_VALUE,
+        RegistryOperation.DELETE_VALUE,
+        RegistryOperation.DELETE_VALUE,
+        RegistryOperation.DELETE_ALL_VALUES,
+        RegistryOperation.DELETE_KEY,
+        RegistryOperation.DELETE_KEY,
+        RegistryOperation.SECURE_KEY,
+        RegistryOperation.SET_IF_ABSENT,
+    ]
+    assert [item.registry_value_name for item in settings[:3]] == [
+        "One",
+        "Two",
+        "Three",
+    ]
+    assert settings[-1].name == key + "\\Enabled"
+
+
+def test_registry_pol_rejects_malformed_delete_instruction() -> None:
+    data = b"PReg" + struct.pack("<I", 1)
+    data += _registry_record(
+        "Software\\Policies\\Example",
+        "**Del.Enabled",
+        1,
+        _wide("not-a-space\x00"),
+    )
+    with pytest.raises(ValueError, match="one space"):
+        parse_registry_pol(data)
 
 
 def test_registry_pol_rejects_bad_signature() -> None:

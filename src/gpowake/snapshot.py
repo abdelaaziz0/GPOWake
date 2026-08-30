@@ -33,8 +33,8 @@ from .redaction import redact_sensitive, redact_value
 from .secure_io import secure_write_text
 
 
-SCHEMA_VERSION = 5
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, SCHEMA_VERSION})
+SCHEMA_VERSION = 6
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, SCHEMA_VERSION})
 MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
 MAX_REFERENCED_POLICY_BYTES = 64 * 1024 * 1024
 MAX_REFERENCED_POLICY_TOTAL_BYTES = 256 * 1024 * 1024
@@ -584,6 +584,13 @@ def environment_to_dict(environment: Environment) -> dict[str, Any]:
                         "risk_rule_id": setting.risk_rule_id,
                         "unexpected_trustees": setting.unexpected_trustees,
                         "value_sensitivity": setting.value_sensitivity.value,
+                        "registry_operation": (
+                            setting.registry_operation.value
+                            if setting.registry_operation is not None
+                            else None
+                        ),
+                        "registry_key": setting.registry_key,
+                        "registry_value_name": setting.registry_value_name,
                     }
                     for setting in gpo.settings
                 ],

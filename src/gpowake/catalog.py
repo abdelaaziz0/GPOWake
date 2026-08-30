@@ -4,6 +4,7 @@ from dataclasses import replace
 from typing import Any
 
 from .models import (
+    RegistryOperation,
     Setting,
     SettingKind,
     Severity,
@@ -318,7 +319,37 @@ def setting_from_dict(data: dict[str, Any]) -> Setting:
     if type(dangerous_value) is not bool:
         raise ValueError("Setting.dangerous must be a JSON boolean")
     sensitivity = ValueSensitivity(data.get("value_sensitivity", "PUBLIC"))
-    normalized_name = _normalized_registry_name(str(data["name"]))
+    name = str(data["name"])
+    registry_operation_value = data.get("registry_operation")
+    registry_operation = (
+        RegistryOperation(registry_operation_value)
+        if registry_operation_value is not None
+        else None
+    )
+    registry_key = data.get("registry_key")
+    registry_value_name = data.get("registry_value_name")
+    if kind is SettingKind.REGISTRY and registry_operation is None:
+        key, separator, value_name = name.rpartition("\\")
+        instruction = value_name.casefold() if separator else ""
+        if instruction.startswith("**soft."):
+            # This operation has a one-to-one semantic representation, so it
+            # can be migrated safely while loading an older snapshot. Resolve
+            # the real target before secret classification.
+            target = value_name[len("**soft.") :]
+            if not target:
+                raise ValueError("legacy Registry.pol **soft instruction lacks a value name")
+            name = f"{key}\\{target}"
+            registry_operation = RegistryOperation.SET_IF_ABSENT
+            registry_key = key
+            registry_value_name = target
+        elif instruction.startswith("**"):
+            # DeleteValues/DeleteKeys can expand into several ordered semantic
+            # records. A single legacy Setting cannot be migrated faithfully.
+            raise ValueError(
+                "legacy snapshot contains an unmodeled Registry.pol special "
+                f"instruction {value_name!r}; recollect or reparse the policy"
+            )
+    normalized_name = _normalized_registry_name(name)
     if (
         kind is SettingKind.REGISTRY
         and normalized_name
@@ -340,7 +371,7 @@ def setting_from_dict(data: dict[str, Any]) -> Setting:
         value = {"secret_present": True}
     setting = Setting(
         kind=kind,
-        name=data["name"],
+        name=name,
         value=value,
         dangerous=dangerous_value,
         severity=Severity(data.get("severity", "MEDIUM")),
@@ -349,5 +380,8 @@ def setting_from_dict(data: dict[str, Any]) -> Setting:
         risk_rule_id=data.get("risk_rule_id"),
         unexpected_trustees=tuple(data.get("unexpected_trustees", ())),
         value_sensitivity=sensitivity,
+        registry_operation=registry_operation,
+        registry_key=registry_key,
+        registry_value_name=registry_value_name,
     )
     return assess_setting(setting)

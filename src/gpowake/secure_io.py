@@ -3,15 +3,20 @@ from __future__ import annotations
 import os
 import csv
 import io
+import ipaddress
 import re
 import stat
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Iterator
 
 
 MAX_CREDENTIAL_BYTES = 64 * 1024
+MAX_CCACHE_BYTES = 16 * 1024 * 1024
+MAX_PFX_BYTES = 16 * 1024 * 1024
 
 
 def _read_descriptor_bytes(descriptor: int) -> bytes:
@@ -154,3 +159,194 @@ def read_bounded_fd(descriptor: int) -> str:
     if descriptor < 0:
         raise ValueError("credential file descriptor cannot be negative")
     return _read_descriptor_bytes(descriptor).decode("utf-8", errors="strict")
+
+
+@contextmanager
+def _scoped_secret_copy(
+    path: str | Path,
+    *,
+    label: str,
+    max_bytes: int,
+    prefix: str,
+    suffix: str,
+) -> Iterator[str]:
+    if os.name != "posix":
+        raise ValueError(
+            f"explicit {label} files require POSIX owner/mode validation; "
+            "run collection from Linux or WSL"
+        )
+    value = os.fspath(path)
+    if not value:
+        raise ValueError(f"{label} requires a non-empty file path")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    source_descriptor = os.open(value, flags)
+    temporary_descriptor = -1
+    temporary_name: str | None = None
+    try:
+        metadata = os.fstat(source_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} must be a regular file, not a link")
+        if metadata.st_uid != os.geteuid():
+            raise ValueError(f"{label} must be owned by the current user")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError(f"{label} permissions must be 0600 or stricter")
+        if metadata.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds the {max_bytes}-byte limit")
+
+        temporary_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=prefix, suffix=suffix
+        )
+        os.fchmod(temporary_descriptor, 0o600)
+        total = 0
+        while True:
+            chunk = os.read(
+                source_descriptor, min(64 * 1024, max_bytes + 1 - total)
+            )
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"{label} grew beyond the {max_bytes}-byte limit")
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(temporary_descriptor, remaining)
+                if written <= 0:
+                    raise OSError(f"failed to copy {label}")
+                remaining = remaining[written:]
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = -1
+        yield temporary_name
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+@contextmanager
+def scoped_private_key_file(path: str | Path) -> Iterator[str]:
+    """Yield a stable owner-only temporary copy of a PFX/P12 credential."""
+
+    with _scoped_secret_copy(
+        path,
+        label="PFX credential",
+        max_bytes=MAX_PFX_BYTES,
+        prefix="gpowake-pfx-",
+        suffix=".pfx",
+    ) as copied:
+        yield copied
+
+
+@contextmanager
+def scoped_credential_cache(path: str | Path) -> Iterator[str]:
+    """Expose a stable owner-only ccache copy only for one collection call.
+
+    GSSAPI and Impacket both consume ``KRB5CCNAME``. Copying from an already
+    opened, no-follow descriptor removes the validation/use race, while the
+    scoped environment restoration prevents credential state leaking into a
+    later in-process command.
+    """
+
+    value = os.fspath(path)
+    if value.startswith("FILE:"):
+        value = value[len("FILE:") :]
+    elif re.match(r"^[A-Za-z]+:", value):
+        raise ValueError("--ccache currently supports only FILE credential caches")
+    previous = os.environ.get("KRB5CCNAME")
+    with _scoped_secret_copy(
+        value,
+        label="ccache",
+        max_bytes=MAX_CCACHE_BYTES,
+        prefix="gpowake-ccache-",
+        suffix=".bin",
+    ) as copied:
+        # A bare path is the common denominator: MIT Kerberos interprets it as
+        # a FILE cache, while Impacket incorrectly treats a ``FILE:`` prefix as
+        # part of the filename when loading KRB5CCNAME.
+        cache_name = copied
+        os.environ["KRB5CCNAME"] = cache_name
+        try:
+            yield cache_name
+        finally:
+            if previous is None:
+                os.environ.pop("KRB5CCNAME", None)
+            else:
+                os.environ["KRB5CCNAME"] = previous
+
+
+@contextmanager
+def scoped_kerberos_config(domain: str, dc_ip: str) -> Iterator[str]:
+    """Pin one Kerberos realm to an explicit KDC for a collection call.
+
+    MIT Kerberos otherwise performs DNS SRV discovery even when GPOWake was
+    given ``--dc-ip``. A private, short-lived configuration makes ccache and
+    PKINIT authentication deterministic in segmented networks without
+    modifying the operator's global Kerberos configuration.
+    """
+
+    if os.name != "posix":
+        raise ValueError("Kerberos KDC pinning requires Linux or WSL")
+    normalized_domain = domain.rstrip(".").casefold()
+    if re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", normalized_domain) is None:
+        raise ValueError("--domain is not a valid DNS domain for Kerberos")
+    try:
+        address = ipaddress.ip_address(dc_ip)
+    except ValueError as exc:
+        raise ValueError("--dc-ip must be a literal IPv4 or IPv6 address") from exc
+    kdc = f"[{address}]" if address.version == 6 else str(address)
+    realm = normalized_domain.upper()
+    document = (
+        "[libdefaults]\n"
+        f" default_realm = {realm}\n"
+        " dns_lookup_kdc = false\n"
+        " dns_lookup_realm = false\n"
+        " rdns = false\n"
+        " dns_canonicalize_hostname = false\n\n"
+        "[realms]\n"
+        f" {realm} = {{\n"
+        f"  kdc = {kdc}\n"
+        " }\n\n"
+        "[domain_realm]\n"
+        f" .{normalized_domain} = {realm}\n"
+        f" {normalized_domain} = {realm}\n"
+    ).encode("ascii")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="gpowake-krb5-", suffix=".conf"
+    )
+    previous = os.environ.get("KRB5_CONFIG")
+    try:
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(document)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("failed to write temporary Kerberos configuration")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.environ["KRB5_CONFIG"] = temporary_name
+        yield temporary_name
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if previous is None:
+            os.environ.pop("KRB5_CONFIG", None)
+        else:
+            os.environ["KRB5_CONFIG"] = previous
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass

@@ -8,7 +8,9 @@ from gpowake.models import (
     ActionType,
     DormancyReason,
     Link,
+    ScopeOfManagement,
     SettingKind,
+    SomKind,
 )
 from gpowake.solver import CounterfactualSolver
 
@@ -141,6 +143,13 @@ def test_wmi_results_are_target_specific() -> None:
     assert findings
     assert {name for finding in findings for name in finding.targets} == {"WMI-TRUE"}
 
+    solver = CounterfactualSolver(env)
+    solver.solve()
+    assert any(
+        gap.target == "WMI-FALSE" and gap.gate == "WMI_MUTATION_UNSUPPORTED"
+        for gap in solver.coverage_gaps
+    )
+
 
 def test_legacy_global_true_wmi_result_is_not_treated_as_all_targets_true() -> None:
     danger = dangerous_gpo(
@@ -195,7 +204,7 @@ def test_live_collector_gpt_read_is_not_target_authorization() -> None:
     assert CounterfactualSolver(env).solve()
 
 
-def test_incomplete_settings_and_site_resolution_block_findings() -> None:
+def test_incomplete_settings_and_relevant_site_resolution_block_findings() -> None:
     env = environment(
         ou_links=(Link(DANGEROUS_DN, 0, 2), Link(SAFE_DN, 0, 1)),
         ou_sd=som_sd(GPLINK_GUID),
@@ -214,6 +223,16 @@ def test_incomplete_settings_and_site_resolution_block_findings() -> None:
     env.gpos[SAFE_DN.casefold()] = safe
     env.targets[0] = replace(
         env.targets[0], site_resolution_error="target site could not be resolved"
+    )
+    # An unresolved site cannot affect policy when no collected site has an
+    # enabled link, so the independently proven OU path remains reportable.
+    assert CounterfactualSolver(env).solve()
+
+    site_dn = "CN=Paris,CN=Sites,CN=Configuration,DC=corp,DC=local"
+    env.soms[site_dn.casefold()] = ScopeOfManagement(
+        site_dn,
+        SomKind.SITE,
+        links=(Link(SAFE_DN),),
     )
     site_solver = CounterfactualSolver(env)
     assert site_solver.solve() == []

@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from ipaddress import ip_address
+from math import ceil
 from typing import Any
 from urllib.parse import urlparse
 
@@ -34,6 +35,26 @@ from ..models import (
 
 EVERYONE = "S-1-1-0"
 AUTHENTICATED_USERS = "S-1-5-11"
+CREATOR_OWNER = "S-1-3-0"
+LOCAL_SYSTEM = "S-1-5-18"
+ENTERPRISE_DOMAIN_CONTROLLERS = "S-1-5-9"
+# Well-known pseudo-principals that appear in the default ACL of essentially
+# every AD object (including every GPO's security descriptor) but have no
+# directory object of their own, so an LDAP objectSid lookup for them always
+# returns nothing. Without special-casing them, _target_group_memberships
+# would mark them permanently "unresolved", which cascades into every
+# read/apply security-filter decision coming back UNKNOWN for any real-world
+# GPO -- not just this lab's. CREATOR_OWNER and LOCAL_SYSTEM are contextual
+# to the object being evaluated locally and are never a target computer's own
+# membership over the network, so they are always safe to treat as resolved
+# with no membership contribution. ENTERPRISE_DOMAIN_CONTROLLERS is a real,
+# well-known virtual group (every domain controller in the forest); it is
+# also pre-resolved here (no DN to query), and its actual membership is
+# attributed per-target from userAccountControl where computer accounts are
+# built (a target is only ever a member when it is itself a DC).
+WELL_KNOWN_NO_OBJECT_SIDS = frozenset(
+    {CREATOR_OWNER, LOCAL_SYSTEM, ENTERPRISE_DOMAIN_CONTROLLERS}
+)
 EMPTY_LM_HASH = "aad3b435b51404eeaad3b435b51404ee"
 _GUID_RE = re.compile(r"\{([0-9a-fA-F-]{36})\}")
 
@@ -159,7 +180,8 @@ def _sid(raw: bytes | str | None) -> str | None:
 
 
 def _sid_filter(sid: str) -> str:
-    parts = normalize_sid(sid).split("-")
+    normalized = normalize_sid(sid)
+    parts = normalized.split("-")
     if len(parts) < 4 or parts[0] != "S":
         raise ValueError(f"invalid SID {sid!r}")
     try:
@@ -174,10 +196,12 @@ def _sid_filter(sid: str) -> str:
         not 0 <= item <= 0xFFFFFFFF for item in subauthorities
     ):
         raise ValueError(f"invalid SID {sid!r}")
-    data = bytes((revision, len(subauthorities)))
-    data += authority.to_bytes(6, "big")
-    data += b"".join(item.to_bytes(4, "little") for item in subauthorities)
-    return "".join(f"\\{byte:02x}" for byte in data)
+    # Active Directory accepts the canonical SID syntax for objectSid equality
+    # filters. Windows Server 2025 returned no rows for an RFC 4515 byte-escaped
+    # binary SID through ldap3, including when ldap3's own escape_bytes helper
+    # produced the identical filter. Return the already strictly numeric,
+    # injection-safe canonical representation that works across the live path.
+    return normalized
 
 
 def _escape_filter_value(value: str) -> str:
@@ -344,8 +368,15 @@ class LDAPCollector:
             connect_timeout=self.config.connect_timeout,
         )
         auth = self.config.auth
+        # ldap3 2.10.2rc4 passes receive_timeout to struct.pack("LL", ...)
+        # on POSIX. Supplying the float accepted by our CLI therefore crashes
+        # before bind. Round fractional seconds up while always passing the
+        # integer that ldap3's socket adapter requires.
+        ldap_receive_timeout = max(1, ceil(self.config.receive_timeout))
         if auth.kerberos:
             user = auth.username
+            if user and "@" not in user and "\\" not in user:
+                user = f"{user}@{self.config.domain.upper()}"
             connection = Connection(
                 server,
                 user=user or None,
@@ -353,9 +384,10 @@ class LDAPCollector:
                 authentication=SASL,
                 sasl_mechanism=KERBEROS,
                 sasl_credentials=(self.config.dc_host or self.config.domain,),
+                session_security=ENCRYPT,
                 auto_bind=True,
                 raise_exceptions=True,
-                receive_timeout=self.config.receive_timeout,
+                receive_timeout=ldap_receive_timeout,
                 auto_referrals=False,
                 read_only=True,
             )
@@ -392,7 +424,7 @@ class LDAPCollector:
                 authentication=authentication,
                 auto_bind=True,
                 raise_exceptions=True,
-                receive_timeout=self.config.receive_timeout,
+                receive_timeout=ldap_receive_timeout,
                 auto_referrals=False,
                 read_only=True,
                 **ntlm_security,
@@ -402,7 +434,7 @@ class LDAPCollector:
                 server,
                 auto_bind=True,
                 raise_exceptions=True,
-                receive_timeout=self.config.receive_timeout,
+                receive_timeout=ldap_receive_timeout,
                 auto_referrals=False,
                 read_only=True,
             )
@@ -838,6 +870,11 @@ class LDAPCollector:
         memberships, unresolved, possible_group_sids = self._target_group_memberships(
             base_dn, selection, relevant_sids
         )
+        has_enabled_site_links = any(
+            som.kind is SomKind.SITE
+            and any(not link.disabled for link in som.links)
+            for som in soms.values()
+        )
         targets: list[Target] = []
         for original in entries:
             sid = _sid(_first(_raw(original, "objectSid")))
@@ -864,7 +901,7 @@ class LDAPCollector:
             site_name = str(_first(attrs.get("msDS-SiteName"), ""))
             site_dn = site_names.get(site_name.casefold()) if site_name else None
             site_resolution_error = None
-            if not site_dn:
+            if not site_dn and has_enabled_site_links:
                 site_resolution_error = (
                     f"site unknown for target {name}; site-linked policy can alter "
                     "LSDOU precedence"
@@ -890,6 +927,7 @@ class LDAPCollector:
                     "only DACLs naming those trustees are treated as UNKNOWN"
                 )
             uac = int(_first(attrs.get("userAccountControl"), 0) or 0)
+            is_domain_controller = bool(uac & 0x2000)
             token_sids = set(_token_sids(original))
             if primary_group_sid:
                 token_sids.add(primary_group_sid)
@@ -897,6 +935,8 @@ class LDAPCollector:
                     primary_ancestry.get(primary_group_sid, set()) & relevant_sids
                 )
             token_sids.update(memberships.get(normalize_dn(original["dn"]), set()))
+            if is_domain_controller and ENTERPRISE_DOMAIN_CONTROLLERS in relevant_sids:
+                token_sids.add(ENTERPRISE_DOMAIN_CONTROLLERS)
             targets.append(
                 Target(
                     dn=original["dn"],
@@ -908,7 +948,7 @@ class LDAPCollector:
                     dns_domain=dns_domain,
                     netbios_domain=netbios_domain,
                     site_dn=site_dn,
-                    criticality="DOMAIN_CONTROLLER" if uac & 0x2000 else "NORMAL",
+                    criticality="DOMAIN_CONTROLLER" if is_domain_controller else "NORMAL",
                     token_incomplete=False,
                     unresolved_token_sids=unique_normalized_sids(
                         sorted(target_unresolved)
@@ -1008,9 +1048,14 @@ class LDAPCollector:
 
         if not relevant_sids:
             return {}, set(), set()
-        sid_list = sorted(relevant_sids)
+        # Well-known pseudo-principals have no directory object to look up; an
+        # LDAP query for them always returns nothing, which would otherwise
+        # mark them permanently unresolved. Pre-resolve them with no group
+        # membership contribution (Enterprise Domain Controllers membership is
+        # instead attributed per-target from userAccountControl).
+        resolved_objects: set[str] = set(relevant_sids) & WELL_KNOWN_NO_OBJECT_SIDS
+        sid_list = sorted(relevant_sids - resolved_objects)
         groups: dict[str, str] = {}
-        resolved_objects: set[str] = set()
         unresolved: set[str] = set()
         for start in range(0, len(sid_list), 50):
             chunk = sid_list[start : start + 50]

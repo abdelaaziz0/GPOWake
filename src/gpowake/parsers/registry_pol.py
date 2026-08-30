@@ -4,7 +4,12 @@ import struct
 from pathlib import Path
 
 from ..catalog import REGISTRY_CSE_GUID, assess_setting
-from ..models import Setting, SettingKind, ValueSensitivity
+from ..models import (
+    RegistryOperation,
+    Setting,
+    SettingKind,
+    ValueSensitivity,
+)
 
 
 REG_SZ = 1
@@ -71,6 +76,140 @@ def _is_default_password(name: str) -> bool:
     )
 
 
+def _require_type(value_name: str, reg_type: int, expected: int) -> None:
+    if reg_type != expected:
+        raise ValueError(
+            f"Registry.pol instruction {value_name} requires type {expected}, "
+            f"got {reg_type}"
+        )
+
+
+def _registry_setting(
+    key: str,
+    value_name: str | None,
+    operation: RegistryOperation,
+    value: object,
+) -> Setting:
+    name = key if value_name is None else f"{key}\\{value_name}"
+    sensitivity = ValueSensitivity.PUBLIC
+    if (
+        operation in {RegistryOperation.SET_VALUE, RegistryOperation.SET_IF_ABSENT}
+        and _is_default_password(name)
+        and isinstance(value, dict)
+        and isinstance(value.get("data"), str)
+        and bool(value["data"])
+    ):
+        # The semantic target is resolved before classification, so spellings
+        # such as **soft.DefaultPassword cannot bypass immediate destruction.
+        value = {"type": value.get("type"), "secret_present": True}
+        sensitivity = ValueSensitivity.SECRET
+    return assess_setting(
+        Setting(
+            kind=SettingKind.REGISTRY,
+            name=name,
+            value=value,
+            required_extension=REGISTRY_CSE_GUID,
+            value_sensitivity=sensitivity,
+            registry_operation=operation,
+            registry_key=key,
+            registry_value_name=value_name,
+        )
+    )
+
+
+def _semantic_settings(
+    key: str, value_name: str, reg_type: int, raw: bytes
+) -> tuple[Setting, ...]:
+    instruction = value_name.casefold()
+    if instruction == "**deletevalues":
+        _require_type(value_name, reg_type, REG_SZ)
+        decoded = _decode_value(reg_type, raw)
+        assert isinstance(decoded, str)
+        return tuple(
+            _registry_setting(
+                key,
+                target,
+                RegistryOperation.DELETE_VALUE,
+                None,
+            )
+            for target in decoded.split(";")
+            if target
+        )
+    if instruction.startswith("**del."):
+        _require_type(value_name, reg_type, REG_SZ)
+        target = value_name[len("**Del.") :]
+        if not target:
+            raise ValueError("Registry.pol **Del instruction lacks a value name")
+        decoded = _decode_value(reg_type, raw)
+        if decoded != " ":
+            raise ValueError("Registry.pol **Del data must be one space")
+        return (
+            _registry_setting(
+                key,
+                target,
+                RegistryOperation.DELETE_VALUE,
+                None,
+            ),
+        )
+    if instruction == "**delvals.":
+        _require_type(value_name, reg_type, REG_SZ)
+        decoded = _decode_value(reg_type, raw)
+        if decoded != " ":
+            raise ValueError("Registry.pol **DelVals. data must be one space")
+        return (
+            _registry_setting(
+                key,
+                None,
+                RegistryOperation.DELETE_ALL_VALUES,
+                None,
+            ),
+        )
+    if instruction == "**deletekeys":
+        _require_type(value_name, reg_type, REG_SZ)
+        decoded = _decode_value(reg_type, raw)
+        assert isinstance(decoded, str)
+        return tuple(
+            _registry_setting(
+                f"{key}\\{target}",
+                None,
+                RegistryOperation.DELETE_KEY,
+                None,
+            )
+            for target in decoded.split(";")
+            if target
+        )
+    if instruction == "**securekey":
+        _require_type(value_name, reg_type, REG_DWORD)
+        return (
+            _registry_setting(
+                key,
+                None,
+                RegistryOperation.SECURE_KEY,
+                {"type": reg_type, "data": _decode_value(reg_type, raw)},
+            ),
+        )
+    if instruction.startswith("**soft."):
+        target = value_name[len("**soft.") :]
+        if not target:
+            raise ValueError("Registry.pol **soft instruction lacks a value name")
+        return (
+            _registry_setting(
+                key,
+                target,
+                RegistryOperation.SET_IF_ABSENT,
+                {"type": reg_type, "data": _decode_value(reg_type, raw)},
+            ),
+        )
+    return (
+        _registry_setting(
+            key,
+            value_name,
+            RegistryOperation.SET_VALUE,
+            {"type": reg_type, "data": _decode_value(reg_type, raw)},
+        ),
+    )
+
+
 def parse_registry_pol(data: bytes) -> tuple[Setting, ...]:
     if len(data) < 8 or data[:4] != b"PReg":
         raise ValueError("Registry.pol signature is missing")
@@ -103,24 +242,7 @@ def parse_registry_pol(data: bytes) -> tuple[Setting, ...]:
         raw = data[offset : offset + size]
         offset += size
         offset = _expect(data, offset, b"]\x00")
-        name = f"{key}\\{value_name}"
-        decoded = _decode_value(reg_type, raw)
-        sensitivity = ValueSensitivity.PUBLIC
-        value: object = {"type": reg_type, "data": decoded}
-        if _is_default_password(name) and isinstance(decoded, str) and decoded:
-            # Destruction happens immediately: no model object, snapshot, or
-            # report ever receives the credential bytes or a crackable digest.
-            value = {"type": reg_type, "secret_present": True}
-            sensitivity = ValueSensitivity.SECRET
-        settings.append(
-            assess_setting(Setting(
-                kind=SettingKind.REGISTRY,
-                name=name,
-                value=value,
-                required_extension=REGISTRY_CSE_GUID,
-                value_sensitivity=sensitivity,
-            ))
-        )
+        settings.extend(_semantic_settings(key, value_name, reg_type, raw))
     return tuple(settings)
 
 

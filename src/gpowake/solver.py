@@ -53,6 +53,7 @@ from .models import (
     normalize_sid,
 )
 from .precedence import Evaluation, EffectiveSetting, PolicyEngine, PolicyUncertainty
+from .redaction import redact_value
 
 
 _SEVERITY_SCORE = {
@@ -67,6 +68,9 @@ _GPO_EDIT_ACTIONS = {
     ActionType.REWRITE_READ_APPLY_DACL,
     ActionType.ENABLE_COMPUTER_SECTION,
 }
+
+_MAX_TRACE_VALUE_CHARS = 192
+_MAX_TRACE_LINE_CHARS = 512
 
 
 @dataclass(frozen=True)
@@ -292,6 +296,15 @@ class CounterfactualSolver:
         evaluation = self._evaluate(environment, target)
         if evaluation.uncertainties_for(setting):
             return False
+        if PolicyEngine.is_restricted_member_of(setting):
+            return any(
+                not contributor.uncertain
+                and normalize_dn(contributor.gpo.dn) == normalize_dn(gpo.dn)
+                and contributor.setting.value == setting.value
+                for contributor in evaluation.additive_contributors.get(
+                    setting.key, ()
+                )
+            )
         winner = evaluation.winners.get(setting.key)
         return (
             winner is not None
@@ -1315,6 +1328,14 @@ class CounterfactualSolver:
             )
         if candidate.wmi_filter:
             observed = target.wmi_result_for(candidate.wmi_filter)
+            if observed is False or (
+                observed is None and candidate.wmi_result is False
+            ):
+                return (
+                    "WMI_MUTATION_UNSUPPORTED",
+                    "the WMI filter evaluated false and GPOWake does not model "
+                    "a mutation that can make the filter true",
+                )
             if observed is None and candidate.wmi_result is not False:
                 return (
                     "WMI_FILTER",
@@ -1367,9 +1388,29 @@ class CounterfactualSolver:
         return None
 
     @staticmethod
+    def _trace_value(setting: Setting) -> str:
+        safe = redact_value(setting.value, setting.value_sensitivity)
+        rendered = json.dumps(safe, sort_keys=True, default=str, ensure_ascii=True)
+        if len(rendered) <= _MAX_TRACE_VALUE_CHARS:
+            return rendered
+        digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:12]
+        return (
+            f"<{type(safe).__name__} chars={len(rendered)} "
+            f"sha256={digest}>"
+        )
+
+    @staticmethod
+    def _bounded_trace_line(line: str) -> str:
+        if len(line) <= _MAX_TRACE_LINE_CHARS:
+            return line
+        digest = hashlib.sha256(line.encode("utf-8")).hexdigest()[:12]
+        suffix = f"... <truncated chars={len(line)} sha256={digest}>"
+        return line[: _MAX_TRACE_LINE_CHARS - len(suffix)] + suffix
+
+    @staticmethod
     def _trace(evaluation: Evaluation) -> tuple[str, ...]:
         lines = [
-            (
+            CounterfactualSolver._bounded_trace_line(
                 f"{item.som.kind.value}:{item.som.dn} order={item.link.order} "
                 f"enforced={item.link.enforced} disabled={item.link.disabled} "
                 f"gpo={item.link.gpo_dn} status={item.status.value}"
@@ -1378,7 +1419,10 @@ class CounterfactualSolver:
             for item in evaluation.links
         ]
         lines.extend(
-            f"winner {kind}/{name}: {winner.gpo.name} value={winner.setting.value}"
+            CounterfactualSolver._bounded_trace_line(
+                f"winner {kind}/{name}: {winner.gpo.name} "
+                f"value={CounterfactualSolver._trace_value(winner.setting)}"
+            )
             for (kind, name), winner in sorted(evaluation.winners.items())
         )
         return tuple(lines)
@@ -1452,11 +1496,29 @@ class CounterfactualSolver:
                         continue
                     current = evaluation.winners.get(setting.key)
                     if (
-                        current
-                        and not current.uncertain
-                        and not relevant_uncertainties
-                        and normalize_dn(current.gpo.dn) == normalize_dn(candidate.dn)
-                        and current.setting.value == setting.value
+                        not relevant_uncertainties
+                        and (
+                            (
+                                PolicyEngine.is_restricted_member_of(setting)
+                                and any(
+                                    not contributor.uncertain
+                                    and normalize_dn(contributor.gpo.dn)
+                                    == normalize_dn(candidate.dn)
+                                    and contributor.setting.value == setting.value
+                                    for contributor in evaluation.additive_contributors.get(
+                                        setting.key, ()
+                                    )
+                                )
+                            )
+                            or (
+                                not PolicyEngine.is_restricted_member_of(setting)
+                                and current
+                                and not current.uncertain
+                                and normalize_dn(current.gpo.dn)
+                                == normalize_dn(candidate.dn)
+                                and current.setting.value == setting.value
+                            )
+                        )
                     ):
                         continue
                     newly_privileged = self._newly_privileged(setting, current)

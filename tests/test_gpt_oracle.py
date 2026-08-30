@@ -330,7 +330,11 @@ def test_smb_oracle_preflight_rejects_aggregate_byte_budget(monkeypatch) -> None
 
 def test_pinned_ldap_bind_attests_exact_machine_sid(monkeypatch) -> None:
     env = _live_hashed_environment(b"gpt")
-    target = replace(env.targets[0], name="srv1.corp.local")
+    target = replace(
+        env.targets[0],
+        name="srv1.corp.local",
+        token_sids=(*env.targets[0].token_sids, "S-1-1-0", "S-1-5-11"),
+    )
     closed = []
 
     class FakeValue:
@@ -343,6 +347,13 @@ def test_pinned_ldap_bind_attests_exact_machine_sid(monkeypatch) -> None:
     class FakeSearchResultEntry(dict):
         pass
 
+    implicit = {target.sid.casefold(), "s-1-1-0", "s-1-5-11"}
+    group_sids = sorted(
+        sid for sid in target.all_sids if sid.casefold() not in implicit
+    )
+    encoded_groups = {
+        f"group-{index}".encode(): sid for index, sid in enumerate(group_sids)
+    }
     entry = FakeSearchResultEntry(
         attributes=[
             {"type": "sAMAccountName", "vals": [FakeValue(b"SRV1$")]},
@@ -350,6 +361,10 @@ def test_pinned_ldap_bind_attests_exact_machine_sid(monkeypatch) -> None:
             {
                 "type": "dNSHostName",
                 "vals": [FakeValue(b"srv1.corp.local")],
+            },
+            {
+                "type": "tokenGroups",
+                "vals": [FakeValue(value) for value in encoded_groups],
             },
         ]
     )
@@ -367,6 +382,8 @@ def test_pinned_ldap_bind_attests_exact_machine_sid(monkeypatch) -> None:
         def search(self, **kwargs):
             assert kwargs["searchBase"] == target.dn
             assert kwargs["searchFilter"] == "(objectClass=computer)"
+            assert "tokenGroups" in kwargs["attributes"]
+            assert "sIDHistory" in kwargs["attributes"]
             return [entry]
 
         def close(self):
@@ -374,10 +391,12 @@ def test_pinned_ldap_bind_attests_exact_machine_sid(monkeypatch) -> None:
 
     class FakeSid:
         def __init__(self, data):
-            assert data == b"binary-sid"
+            self.data = data
 
         def formatCanonical(self):
-            return target.sid
+            if self.data == b"binary-sid":
+                return target.sid
+            return encoded_groups[self.data]
 
     package = types.ModuleType("impacket")
     package.__path__ = []  # type: ignore[attr-defined]
