@@ -271,9 +271,6 @@ def scoped_credential_cache(path: str | Path) -> Iterator[str]:
         prefix="gpowake-ccache-",
         suffix=".bin",
     ) as copied:
-        # A bare path is the common denominator: MIT Kerberos interprets it as
-        # a FILE cache, while Impacket incorrectly treats a ``FILE:`` prefix as
-        # part of the filename when loading KRB5CCNAME.
         cache_name = copied
         os.environ["KRB5CCNAME"] = cache_name
         try:

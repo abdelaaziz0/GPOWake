@@ -12,8 +12,6 @@ class Capability(str, Enum):
     WRITE_GPO_CONTAINER = "WriteGPOContainer"
     WRITE_GPO_FILESYSTEM = "WriteGPOFileSystem"
     WRITE_GPO_SECURITY = "WriteGPOSecurity"
-    # WRITE_DAC on a scope of management (owner-implicit or explicit); lets the
-    # actor rewrite the SOM DACL to grant itself gPLink and then modify the link.
     WRITE_SOM_SECURITY = "WriteSOMSecurity"
     WRITE_WMI_FILTER = "WriteWMIFilter"
 
@@ -108,9 +106,6 @@ class GptAccessSource(str, Enum):
 class AceType(str, Enum):
     ALLOW = "ALLOW"
     DENY = "DENY"
-    # An ACE type GPOWake cannot interpret (callback/conditional/system ACEs).
-    # It is retained in DACL order so the access check can fail closed instead
-    # of silently dropping a potentially relevant deny.
     UNSUPPORTED = "UNSUPPORTED"
 
 
@@ -121,8 +116,6 @@ class Ace:
     access_mask: int
     object_type: str | None = None
     inherited: bool = False
-    # INHERIT_ONLY_ACE (0x08): the ACE applies only to child objects and does
-    # not grant anything on the object that carries it.
     inherit_only: bool = False
 
     def __post_init__(self) -> None:
@@ -153,22 +146,11 @@ class AccessResult:
 @dataclass(frozen=True)
 class SecurityDescriptor:
     aces: tuple[Ace, ...] = ()
-    # A null DACL grants full access. An empty (but present) DACL grants none.
     null_dacl: bool = False
     collection_error: str | None = None
-    # Owner SID: owners hold implicit READ_CONTROL/WRITE_DAC unless an explicit
-    # OWNER RIGHTS (S-1-3-4) ACE constrains them.
     owner_sid: str | None = None
-    # True when a UNSUPPORTED ACE is present; the access check fails closed.
     has_unsupported_ace: bool = False
-    # AD's BlockOwnerImplicitRights behavior can suppress owner-implicit
-    # WRITE_DAC on computer-derived objects. Collectors or fixtures set this
-    # after evaluating the applicable dsHeuristics and requester token.
     owner_implicit_rights_blocked: bool = False
-    # True only when the collector/fixture established that owner-implicit
-    # rights semantics are known for this object. Live LDAP collection sets
-    # this for the non-computer AD object classes GPOWake evaluates. An
-    # unverified owner-derived grant is UNKNOWN rather than optimistic ALLOW.
     owner_implicit_rights_verified: bool = False
 
 
@@ -228,16 +210,9 @@ class Setting:
     severity: Severity = Severity.MEDIUM
     rationale: str = ""
     required_extension: str | None = None
-    # Automatic classifications carry a versioned rule identifier. A dangerous
-    # snapshot setting with no rule ID remains an explicit user override.
     risk_rule_id: str | None = None
     unexpected_trustees: tuple[str, ...] = ()
-    # SECRET values are destroyed at ingestion and may only be represented by
-    # a presence marker. Serializers and renderers enforce this again.
     value_sensitivity: ValueSensitivity = ValueSensitivity.PUBLIC
-    # Registry.pol is an ordered operation stream. These fields retain the
-    # semantic target separately from the raw instruction spelling so delete,
-    # set-if-absent, and key operations can be replayed correctly.
     registry_operation: RegistryOperation | None = None
     registry_key: str | None = None
     registry_value_name: str | None = None
@@ -288,27 +263,19 @@ class GPO:
     machine_extensions: tuple[str, ...] | None = None
     settings: tuple[Setting, ...] = ()
     security_descriptor: SecurityDescriptor = field(default_factory=SecurityDescriptor)
-    # Legacy/offline assertion that targets can read the GPT. Live collection
-    # records collector access separately and requires per-target decisions.
     gpt_readable: bool = True
     collector_gpt_readable: bool | None = None
     settings_complete: bool = True
     settings_uncertainty_reasons: tuple[str, ...] = ()
-    # The supported policy families whose files could not be collected or
-    # parsed. An empty tuple while ``settings_complete`` is false is the
-    # conservative legacy representation: any supported family may be absent.
     incomplete_setting_kinds: tuple[SettingKind, ...] = ()
     actor_gpt_write_decisions: tuple[tuple[str, AccessDecision], ...] = ()
     wmi_filter: str | None = None
-    # True/False is an observed deterministic result. None means unknown/not evaluated.
     wmi_result: bool | None = None
     file_acl_writable_sids: tuple[str, ...] = ()
     version_number: int | None = None
     gpt_version: int | None = None
     usn_changed: int | None = None
-    # Relative GPT path -> SHA-256, collected from the same SMB endpoint.
     gpt_hashes: tuple[tuple[str, str], ...] = ()
-    # Relative GPT path -> byte length, collected from the same read as the hash.
     gpt_file_sizes: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self) -> None:
@@ -376,9 +343,6 @@ class Principal:
     sid: str
     name: str
     token_sids: tuple[str, ...]
-    # True when the group token could not be fully enumerated (e.g. tokenGroups
-    # was not readable); group-derived rights may be undercounted, so findings
-    # for this principal must fail closed to LOW confidence.
     token_incomplete: bool = False
 
     @property
@@ -550,13 +514,9 @@ class Target:
     netbios_domain: str | None = None
     site_dn: str | None = None
     criticality: str = "NORMAL"
-    # Legacy all-or-nothing marker retained for schema-1 compatibility. New
-    # collection records the exact unresolved ACL trustees below instead.
     token_incomplete: bool = False
     unresolved_token_sids: tuple[str, ...] = ()
-    # WMI results are target observations keyed by the GPO's WMI filter ID/DN.
     wmi_results: tuple[tuple[str, bool], ...] = ()
-    # Structured observations take precedence over the schema-2 legacy tuple.
     gpt_read_observations: tuple[GptAccessObservation, ...] = ()
     gpt_read_decisions: tuple[tuple[str, AccessDecision], ...] = ()
     site_resolution_error: str | None = None
@@ -674,8 +634,6 @@ class ActionType(str, Enum):
     CLEAR_BLOCK_INHERITANCE = "ClearBlockInheritance"
     GRANT_READ_APPLY = "GrantReadAndApplyGroupPolicy"
     ENABLE_COMPUTER_SECTION = "EnableComputerSection"
-    # Use WRITE_DAC on a SOM to grant the actor WriteGPLink, enabling a
-    # subsequent link modification. The two form one two-action path.
     GRANT_GPLINK = "GrantWriteGPLink"
     REWRITE_GPLINK_DACL = "ExplicitBlockerRewriteWriteGPLink"
     REWRITE_READ_APPLY_DACL = "ExplicitBlockerRewriteReadAndApplyGroupPolicy"
@@ -699,14 +657,9 @@ class Action:
     authorization: tuple[AccessEvidence, ...] = ()
     dacl_removed: tuple[Ace, ...] = ()
     dacl_added: tuple[Ace, ...] = ()
-    # Human- and machine-readable upper bound on rights newly exposed by a
-    # conservative additive DACL rewrite.
     newly_exposed_rights: tuple[str, ...] = ()
     dacl_rewrite_mode: DaclRewriteMode | None = None
-    # Trustees named by a removed ACE can have members outside the snapshot.
     collateral_trustees: tuple[str, ...] = ()
-    # Before/after authorization changes for observed principals or targets,
-    # plus an explicit warning for membership outside the snapshot.
     collateral_effects: tuple[str, ...] = ()
 
     def identity(self) -> tuple[Any, ...]:
@@ -734,7 +687,6 @@ class Finding:
     dormant_value: Any
     reason: DormancyReason
     current_winner: str | None
-    # The representative (fewest-action, then lexicographic) activation path.
     actions: tuple[Action, ...]
     targets: list[str]
     target_dns: list[str]
@@ -743,9 +695,6 @@ class Finding:
     score: float
     requires_gpo_edit: bool
     requires_sysvol_write: bool = False
-    # Other minimal activation paths for the same dormant setting (e.g. reorder
-    # vs. enforce). Reported as alternatives on a single finding rather than as
-    # separate duplicate-looking findings.
     alternative_paths: tuple[tuple[Action, ...], ...] = ()
     outcome: OutcomeClass = OutcomeClass.POSSIBLE
     confidence: Confidence = Confidence.LOW

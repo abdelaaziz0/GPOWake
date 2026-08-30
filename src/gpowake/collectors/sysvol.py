@@ -17,9 +17,9 @@ class SysvolBudgetExceeded(RuntimeError):
 
 _MISSING_POLICY_NTSTATUS = frozenset(
     {
-        0xC000000F,  # STATUS_NO_SUCH_FILE
-        0xC0000034,  # STATUS_OBJECT_NAME_NOT_FOUND
-        0xC000003A,  # STATUS_OBJECT_PATH_NOT_FOUND
+        0xC000000F,
+        0xC0000034,
+        0xC000003A,
     }
 )
 
@@ -53,13 +53,6 @@ def _unc_parts(unc: str) -> tuple[str, str]:
 
 
 def _gpt_version(data: bytes) -> int | None:
-    # gpt.ini has historically been written by Windows GPO tooling in the
-    # local ANSI codepage, not UTF-8: on a non-English-locale DC (e.g. a
-    # French DC writing displayName=... Strat\xe9gie ...), the file is valid
-    # cp1252 but not valid UTF-8. The [General]/Version key itself is always
-    # pure ASCII regardless of locale, so a cp1252 fallback recovers the
-    # version even when other keys (like displayName) contain characters that
-    # break a strict UTF-8 decode.
     for encoding, errors in (("utf-8-sig", "strict"), ("cp1252", "replace")):
         try:
             text = data.decode(encoding, errors=errors)
@@ -91,8 +84,8 @@ def _validated_gpt_location(
 
 def collect_sysvol(environment: Environment, config: CollectionConfig) -> Environment:
     try:
-        from impacket.smbconnection import SMBConnection  # type: ignore[import-not-found]
-    except ImportError as exc:  # pragma: no cover - optional extra
+        from impacket.smbconnection import SMBConnection
+    except ImportError as exc:
         raise RuntimeError(
             "SYSVOL collection requires the 'collect' extra (impacket)"
         ) from exc
@@ -204,8 +197,6 @@ def collect_sysvol(environment: Environment, config: CollectionConfig) -> Enviro
             except SysvolBudgetExceeded:
                 raise
             except Exception as exc:
-                # Missing optional policy files are normal; malformed/read-denied
-                # files are retained as warnings without discarding other CSEs.
                 if not _is_missing_policy_file_error(exc):
                     settings_complete = False
                     settings_uncertainty_reasons.append(

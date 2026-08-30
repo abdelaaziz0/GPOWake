@@ -190,19 +190,15 @@ def render_text(
     return "\n\n".join(sections) + "\n"
 
 
-# ---------------------------------------------------------------------------
-# NetExec-style compact output: one aligned, tagged line per finding, with
-# indented continuation lines for the blast radius and alternative paths.
-# ---------------------------------------------------------------------------
 
 _PROTO = "GPOWAKE"
 _SEVERITY_MARKER = {"CRITICAL": "+", "HIGH": "+", "MEDIUM": "*", "LOW": "-"}
 _MARKER_COLOR = {
-    "+": "\033[92m",  # green  -- activatable
-    "*": "\033[94m",  # blue   -- info
-    "-": "\033[93m",  # yellow -- low confidence
-    "!": "\033[95m",  # magenta -- warning
-    "?": "\033[93m",  # yellow -- possible candidate
+    "+": "\033[92m",
+    "*": "\033[94m",
+    "-": "\033[93m",
+    "!": "\033[95m",
+    "?": "\033[93m",
 }
 _RESET = "\033[0m"
 

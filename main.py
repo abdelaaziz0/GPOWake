@@ -18,8 +18,6 @@ BANNER = r"""
 """
 
 if __name__ == "__main__":
-    # Banner goes to stderr so it never corrupts -o file output or a piped
-    # JSON/JSONL stream on stdout.
     print(BANNER, file=sys.stderr)
     from gpowake.cli import main
 

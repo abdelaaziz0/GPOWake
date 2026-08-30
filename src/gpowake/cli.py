@@ -478,7 +478,6 @@ def _scan(args: argparse.Namespace) -> int:
                 findings, environment.warnings, solver.coverage_gaps
             )
         else:
-            # Colorize only when streaming to an interactive terminal.
             color = not args.output and sys.stdout.isatty()
             rendered = render_netexec(
                 findings,
@@ -653,9 +652,6 @@ def _import_gpt_access(args: argparse.Namespace) -> int:
             hasher.update(chunk)
     source_digest = hasher.hexdigest()
     count = 0
-    # Every document is intentionally checked against the same pristine input
-    # digest. Saving happens only after all imports succeed, so a bad later
-    # document cannot leave a partially merged output snapshot.
     for observation_path in args.observations:
         count += import_gpt_access_observations(
             environment,

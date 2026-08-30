@@ -24,7 +24,7 @@ def pkinit_credential_cache(
 
     try:
         from .pkinit_backend import request_pkinit_tgt
-    except ImportError as exc:  # pragma: no cover - optional extra
+    except ImportError as exc:
         raise RuntimeError(
             "PFX/PKINIT authentication requires the 'pkinit' extra"
         ) from exc

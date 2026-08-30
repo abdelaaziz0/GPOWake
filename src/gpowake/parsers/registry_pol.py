@@ -99,8 +99,6 @@ def _registry_setting(
         and isinstance(value.get("data"), str)
         and bool(value["data"])
     ):
-        # The semantic target is resolved before classification, so spellings
-        # such as **soft.DefaultPassword cannot bypass immediate destruction.
         value = {"type": value.get("type"), "secret_present": True}
         sensitivity = ValueSensitivity.SECRET
     return assess_setting(
@@ -219,7 +217,6 @@ def parse_registry_pol(data: bytes) -> tuple[Setting, ...]:
     offset = 8
     settings: list[Setting] = []
     while offset < len(data):
-        # Some writers leave a UTF-16 NUL between records.
         while data[offset : offset + 2] == b"\x00\x00":
             offset += 2
         if offset >= len(data):

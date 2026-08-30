@@ -77,10 +77,6 @@ class Evaluation:
     links: tuple[LinkEvaluation, ...]
     processing_order: tuple[LinkEvaluation, ...]
     winners: dict[tuple[str, str], EffectiveSetting]
-    # Restricted Groups "Member Of" is inclusion-only. Retain each effective
-    # contributor as well as the merged value so the solver can prove that a
-    # specific dormant GPO became effective without pretending there is one
-    # last-writer winner.
     additive_contributors: dict[
         tuple[str, str], tuple[EffectiveSetting, ...]
     ]
@@ -338,9 +334,6 @@ class PolicyEngine:
 
     @staticmethod
     def _processing_key(item: LinkEvaluation) -> tuple[int, int, int]:
-        # Normal links: site/domain/OU from broad to specific, and high numeric
-        # link order first so order 1 is processed last. Enforced links are then
-        # processed from the deepest scope toward the root; root enforcement wins.
         if item.link.enforced:
             return 1, -item.scope_index, -item.link.order
         return 0, item.scope_index, -item.link.order
@@ -370,7 +363,6 @@ class PolicyEngine:
             winners.pop(setting.key, None)
             return
         if operation is RegistryOperation.SECURE_KEY:
-            # **SecureKey changes the registry key ACL, not effective value data.
             return
 
         target_key = cls._registry_key(setting)

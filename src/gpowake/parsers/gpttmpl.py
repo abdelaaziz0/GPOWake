@@ -16,9 +16,6 @@ class _CaseConfigParser(configparser.RawConfigParser):
 def _decode(data: bytes) -> str:
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         return data.decode("utf-16")
-    # Windows templates are commonly UTF-16LE even when a third-party writer
-    # omits the BOM. Trying UTF-8 first would "succeed" with embedded NULs and
-    # then misparse every section.
     if len(data) >= 4:
         odd_nuls = data[1::2].count(0)
         even_nuls = data[0::2].count(0)

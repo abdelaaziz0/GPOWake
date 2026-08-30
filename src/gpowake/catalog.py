@@ -70,34 +70,27 @@ SECURITY_BASELINE_RULE_ID = "GPOWAKE.SECURITY_BASELINE.v1"
 REGISTRY_SECRET_RULE_ID = "GPOWAKE.REGISTRY_SECRET.v1"
 BUILTIN_ADMINISTRATORS = "S-1-5-32-544"
 
-# Groups that are already full-domain or full-machine administrators. Assigning
-# any privilege to them changes nothing about their effective power, so it is
-# never elevated to a finding regardless of which privilege it is.
 _ALWAYS_EXPECTED_SIDS = {
-    "S-1-5-18",  # Local System
-    "S-1-5-32-544",  # Builtin Administrators
+    "S-1-5-18",
+    "S-1-5-32-544",
 }
-# Per-privilege default holders. A privilege granted only to identities that
-# already hold it by Windows default is expected; anything else is a finding.
-# Deliberately narrow: e.g. Backup Operators is default for Se(Backup|Restore)
-# but NOT for SeDebug/SeTcb, so those on Backup Operators are still flagged.
 _PRIVILEGE_EXPECTED_SIDS: dict[str, set[str]] = {
     "seimpersonateprivilege": {
-        "S-1-5-6",  # Service
-        "S-1-5-19",  # Local Service
-        "S-1-5-20",  # Network Service
+        "S-1-5-6",
+        "S-1-5-19",
+        "S-1-5-20",
     },
     "seassignprimarytokenprivilege": {
-        "S-1-5-19",  # Local Service
-        "S-1-5-20",  # Network Service
+        "S-1-5-19",
+        "S-1-5-20",
     },
     "sebackupprivilege": {
-        "S-1-5-32-551",  # Backup Operators
-        "S-1-5-32-549",  # Server Operators
+        "S-1-5-32-551",
+        "S-1-5-32-549",
     },
     "serestoreprivilege": {
-        "S-1-5-32-551",  # Backup Operators
-        "S-1-5-32-549",  # Server Operators
+        "S-1-5-32-551",
+        "S-1-5-32-549",
     },
 }
 
@@ -257,8 +250,6 @@ def assess_setting(
         return setting
     severity, rationale = rule
     values = {normalize_sid(str(item).lstrip("*")) for item in setting.value}
-    # SeMachineAccountPrivilege is normal for Authenticated Users in many domains;
-    # it is only elevated to a finding when a broad/default population receives it.
     if name_cf == "semachineaccountprivilege":
         is_broad = bool(values & _BROAD_SIDS) or any(
             sid.endswith("-513") for sid in values
@@ -332,9 +323,6 @@ def setting_from_dict(data: dict[str, Any]) -> Setting:
         key, separator, value_name = name.rpartition("\\")
         instruction = value_name.casefold() if separator else ""
         if instruction.startswith("**soft."):
-            # This operation has a one-to-one semantic representation, so it
-            # can be migrated safely while loading an older snapshot. Resolve
-            # the real target before secret classification.
             target = value_name[len("**soft.") :]
             if not target:
                 raise ValueError("legacy Registry.pol **soft instruction lacks a value name")
@@ -343,8 +331,6 @@ def setting_from_dict(data: dict[str, Any]) -> Setting:
             registry_key = key
             registry_value_name = target
         elif instruction.startswith("**"):
-            # DeleteValues/DeleteKeys can expand into several ordered semantic
-            # records. A single legacy Setting cannot be migrated faithfully.
             raise ValueError(
                 "legacy snapshot contains an unmodeled Registry.pol special "
                 f"instruction {value_name!r}; recollect or reparse the policy"

@@ -71,7 +71,7 @@ class SmbOracleConfig:
 
 def _access_denied(exc: Exception) -> bool:
     try:
-        if int(exc.getErrorCode()) == 0xC0000022:  # type: ignore[attr-defined]
+        if int(exc.getErrorCode()) == 0xC0000022:
             return True
     except (AttributeError, TypeError, ValueError):
         pass
@@ -215,13 +215,13 @@ def _attest_machine_sid(
     if target.token_incomplete or target.unresolved_sids:
         raise ValueError("snapshot target token is incomplete and cannot be attested")
     try:
-        from impacket.ldap import ldap  # type: ignore[import-not-found]
-        from impacket.ldap.ldapasn1 import (  # type: ignore[import-not-found]
+        from impacket.ldap import ldap
+        from impacket.ldap.ldapasn1 import (
             Scope,
             SearchResultEntry,
         )
-        from impacket.ldap.ldaptypes import LDAP_SID  # type: ignore[import-not-found]
-    except ImportError as exc:  # pragma: no cover - optional extra
+        from impacket.ldap.ldaptypes import LDAP_SID
+    except ImportError as exc:
         raise RuntimeError(
             "SMB GPT oracle identity attestation requires the 'collect' extra"
         ) from exc
@@ -379,8 +379,8 @@ def collect_smb_effective_observations(
         )
 
     try:
-        from impacket.smbconnection import SMBConnection  # type: ignore[import-not-found]
-    except ImportError as exc:  # pragma: no cover - optional extra
+        from impacket.smbconnection import SMBConnection
+    except ImportError as exc:
         raise RuntimeError(
             "SMB GPT oracle requires the 'collect' extra (impacket)"
         ) from exc

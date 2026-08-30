@@ -79,7 +79,6 @@ def _validate_identity(
 ) -> None:
     upns = _certificate_upns(certificate)
     if not upns:
-        # SID-only/strong-mapping certificates are still checked by the KDC.
         return
     expected = f"{username.rstrip('$')}@{domain.rstrip('.')}".casefold()
     matching = [upn for upn in upns if upn.rstrip(".").casefold() == expected]
@@ -178,8 +177,7 @@ class _ActiveDirectoryPKINIT:
                 "cusec": now.microsecond,
                 "ctime": now.replace(microsecond=0),
                 "nonce": secrets.randbits(31),
-                # SHA-1 is fixed by the AD PKINIT CMS profile/RFC 4556.
-                "paChecksum": hashlib.sha1(request_body.dump()).digest(),  # nosec B324
+                "paChecksum": hashlib.sha1(request_body.dump()).digest(),
             }
         )
         parameters = keys.DomainParameters(
@@ -238,8 +236,7 @@ class _ActiveDirectoryPKINIT:
                 cms.CMSAttribute(
                     {
                         "type": "message_digest",
-                        # SHA-1 is fixed by the AD PKINIT CMS profile/RFC 4556.
-                        "values": [hashlib.sha1(data).digest()],  # nosec B324
+                        "values": [hashlib.sha1(data).digest()],
                     }
                 ),
             ]
@@ -261,7 +258,7 @@ class _ActiveDirectoryPKINIT:
                 "signature": self.private_key.sign(
                     signed_attributes.dump(),
                     padding.PKCS1v15(),
-                    hashes.SHA1(),  # nosec B303 -- required by the AD PKINIT CMS profile
+                    hashes.SHA1(),
                 ),
             }
         )
@@ -312,8 +309,7 @@ class _ActiveDirectoryPKINIT:
         material = b""
         counter = 0
         while len(material) < key_size:
-            # The PKINIT DH key derivation is specified in terms of SHA-1.
-            material += hashlib.sha1(  # nosec B324
+            material += hashlib.sha1(
                 bytes([counter]) + full_key
             ).digest()
             counter += 1

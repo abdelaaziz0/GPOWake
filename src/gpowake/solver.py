@@ -172,16 +172,12 @@ class CounterfactualSolver:
         self.max_coverage_gaps = max_coverage_gaps
         self.candidate_evaluations = 0
         self.transition_evaluations = 0
-        # Capability lookups depend only on the principal and the object's
-        # descriptor (plus file ACL for GPOs); both are hashable and stable, so
-        # results are cached across the P x T x D search.
         self._som_caps: dict[
             tuple[frozenset[str], bool, object], frozenset[Capability]
         ] = {}
         self._gpo_caps: dict[
             tuple[frozenset[str], bool, object, tuple[str, ...]], frozenset[Capability]
         ] = {}
-        # Evaluations of the unmodified base environment are reused per target.
         self._base_eval: dict[Target, Evaluation] = {}
         self._state_eval: dict[tuple[object, Target], Evaluation] = {}
         self.coverage_gaps: list[CoverageGap] = []
@@ -211,7 +207,6 @@ class CounterfactualSolver:
             ),
         )
 
-    # ---- caches -----------------------------------------------------------
     def _caps_som(
         self, principal: Principal, som: ScopeOfManagement
     ) -> frozenset[Capability]:
@@ -277,7 +272,6 @@ class CounterfactualSolver:
         )
         return soms, gpos
 
-    # ---- transition modelling --------------------------------------------
     def _apply_transition(
         self, environment: Environment, action: Action
     ) -> Environment:
@@ -438,10 +432,6 @@ class CounterfactualSolver:
             if normalize_dn(item.link.gpo_dn) == normalize_dn(candidate.dn)
         ]
 
-        # Link the GPO at any applicable scope the actor can influence: site,
-        # domain, and every OU in the chain -- not only the target's own OU. If
-        # the actor cannot write gPLink but can rewrite the SOM DACL (WRITE_DAC,
-        # explicit or owner-implicit), it can grant itself the right first.
         for som in chain:
             som_caps = self._caps_som(principal, som)
             gplink_access = evaluate_access(
@@ -863,7 +853,7 @@ class CounterfactualSolver:
             if gpo is None:
                 raise KeyError(action.gpo_dn)
             result.gpos[normalize_dn(gpo.dn)] = replace(gpo, flags=gpo.flags & ~0x2)
-        else:  # pragma: no cover - future action type guard
+        else:
             raise NotImplementedError(action.type)
         return result
 
@@ -907,8 +897,6 @@ class CounterfactualSolver:
                     else:
                         next_frontier.append((changed, new_path))
             if successes:
-                # Independent writes can be explored in both orders. They are one
-                # state-transition path for reporting purposes, not two findings.
                 unique: dict[frozenset[tuple[object, ...]], tuple[Action, ...]] = {}
                 for success in successes:
                     unique.setdefault(
@@ -918,14 +906,11 @@ class CounterfactualSolver:
             frontier = next_frontier
         return []
 
-    # ---- finding assembly -------------------------------------------------
     @staticmethod
     def _rank_paths(
         paths: list[tuple[Action, ...]],
     ) -> list[tuple[Action, ...]]:
         def sort_key(path: tuple[Action, ...]):
-            # None (an absent link order) would break tuple ordering against an
-            # int, so normalise it to -1 for the sort only.
             return (
                 len(path),
                 tuple(
@@ -1626,14 +1611,10 @@ class CounterfactualSolver:
 
     @classmethod
     def _group(cls, findings: list[Finding]) -> list[Finding]:
-        # Targets were already equivalence-grouped and replay-validated. Do not
-        # merge groups here: doing so can recreate the exact false blast-radius
-        # claim the replay invariant is designed to prevent.
         result = list(findings)
         for finding in result:
             finding.targets = sorted(set(finding.targets))
             finding.target_dns = sorted(set(finding.target_dns))
-            # A small bounded blast-radius bonus, applied only after grouping.
             finding.score = round(
                 min(
                     10.0,

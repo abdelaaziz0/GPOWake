@@ -19,7 +19,6 @@ from .models import (
 )
 
 
-# Active Directory access-mask bits.
 ADS_RIGHT_DS_LIST = 0x00000004
 ADS_RIGHT_DS_READ_PROP = 0x00000010
 ADS_RIGHT_DS_WRITE_PROP = 0x00000020
@@ -31,16 +30,12 @@ GENERIC_ALL = 0x10000000
 GENERIC_WRITE = 0x40000000
 GENERIC_READ = 0x80000000
 
-# ACE header flags.
 INHERIT_ONLY_ACE = 0x08
 INHERITED_ACE = 0x10
 
-# The owner of an object holds only these rights implicitly. WRITE_OWNER is
-# deliberately absent: it requires an applicable ACE or SeTakeOwnershipPrivilege.
 OWNER_IMPLICIT = READ_CONTROL | WRITE_DAC
 OWNER_RIGHTS_SID = "S-1-3-4"
 
-# schemaIDGUID / controlAccessRight GUIDs used by the MVP.
 GPLINK_GUID = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"
 GPOPTIONS_GUID = "f30e3bbf-9ff0-11d1-b603-0000f80367c1"
 FLAGS_GUID = "bf967976-0de6-11d0-a285-00aa003049e2"
@@ -407,8 +402,6 @@ def capabilities_on_som(
         capabilities.add(Capability.WRITE_GPLINK)
     if can_write_property(descriptor, principal.all_sids, GPOPTIONS_GUID):
         capabilities.add(Capability.WRITE_GPOPTIONS)
-    # WRITE_DAC (explicit or owner-implicit) lets the actor rewrite the SOM DACL
-    # to grant itself gPLink, so it is a two-step enabler for link changes.
     if can_write_dacl(descriptor, principal.all_sids):
         capabilities.add(Capability.WRITE_SOM_SECURITY)
     return frozenset(capabilities)
@@ -478,11 +471,6 @@ def rewrite_dacl_grant(
     for mask, object_type in requested:
         item = Ace(sid, AceType.ALLOW, mask, object_type)
         added.append(item)
-    # Preserve every existing ACE and its relative order. Re-canonicalizing an
-    # inherited/noncanonical descriptor can change unrelated principals'
-    # effective rights. New explicit allows are inserted immediately before
-    # the inherited portion, which is sufficient to consume the narrow grant
-    # before any inherited deny without moving pre-existing entries.
     insertion = next(
         (
             index
@@ -638,7 +626,7 @@ def parse_security_descriptor(
             collection_error="security descriptor was not returned"
         )
     try:
-        from impacket.ldap.ldaptypes import (  # type: ignore[import-not-found]
+        from impacket.ldap.ldaptypes import (
             ACCESS_ALLOWED_ACE,
             ACCESS_ALLOWED_OBJECT_ACE,
             ACCESS_DENIED_ACE,
@@ -675,8 +663,6 @@ def parse_security_descriptor(
             inherit_only = bool(flags & INHERIT_ONLY_ACE)
             inherited = bool(flags & INHERITED_ACE)
             if ace_type not in allowed | denied:
-                # Retain the ACE in DACL order so the access check can fail
-                # closed instead of dropping a potentially relevant deny.
                 has_unsupported = True
                 trustee = None
                 mask = 0
@@ -723,7 +709,7 @@ def parse_security_descriptor(
             has_unsupported_ace=has_unsupported,
             owner_implicit_rights_verified=owner_implicit_rights_verified,
         )
-    except Exception as exc:  # corrupted descriptors must fail closed
+    except Exception as exc:
         return SecurityDescriptor(
             collection_error=f"could not parse security descriptor: {exc}"
         )

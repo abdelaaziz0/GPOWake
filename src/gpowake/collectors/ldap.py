@@ -38,28 +38,12 @@ AUTHENTICATED_USERS = "S-1-5-11"
 CREATOR_OWNER = "S-1-3-0"
 LOCAL_SYSTEM = "S-1-5-18"
 ENTERPRISE_DOMAIN_CONTROLLERS = "S-1-5-9"
-# Well-known pseudo-principals that appear in the default ACL of essentially
-# every AD object (including every GPO's security descriptor) but have no
-# directory object of their own, so an LDAP objectSid lookup for them always
-# returns nothing. Without special-casing them, _target_group_memberships
-# would mark them permanently "unresolved", which cascades into every
-# read/apply security-filter decision coming back UNKNOWN for any real-world
-# GPO -- not just this lab's. CREATOR_OWNER and LOCAL_SYSTEM are contextual
-# to the object being evaluated locally and are never a target computer's own
-# membership over the network, so they are always safe to treat as resolved
-# with no membership contribution. ENTERPRISE_DOMAIN_CONTROLLERS is a real,
-# well-known virtual group (every domain controller in the forest); it is
-# also pre-resolved here (no DN to query), and its actual membership is
-# attributed per-target from userAccountControl where computer accounts are
-# built (a target is only ever a member when it is itself a DC).
 WELL_KNOWN_NO_OBJECT_SIDS = frozenset(
     {CREATOR_OWNER, LOCAL_SYSTEM, ENTERPRISE_DOMAIN_CONTROLLERS}
 )
 EMPTY_LM_HASH = "aad3b435b51404eeaad3b435b51404ee"
 _GUID_RE = re.compile(r"\{([0-9a-fA-F-]{36})\}")
 
-# Security descriptor control flags: OWNER (0x01) | DACL (0x04). The owner is
-# required to evaluate implicit owner rights (READ_CONTROL/WRITE_DAC).
 _SD_FLAGS_OWNER_DACL = 0x05
 
 
@@ -72,8 +56,6 @@ class AuthConfig:
     nthash: str = ""
     kerberos: bool = False
     ccache: str | None = None
-    # Explicit opt-in required before a credentialed SIMPLE bind runs over a
-    # non-TLS (ldap://) connection, which would send the password in the clear.
     allow_insecure_simple_bind: bool = False
 
 
@@ -85,15 +67,11 @@ class CollectionConfig:
     ldap_uri: str | None = None
     principals: tuple[str, ...] = ()
     target_filter: str = "(objectCategory=computer)"
-    # Optional target selection (name/DN/SID). Applied before the per-target
-    # tokenGroups round trip so filtered-out computers are never queried.
     target_names: tuple[str, ...] = ()
     auth: AuthConfig = AuthConfig()
     collect_sysvol: bool = True
     ca_file: str | None = None
     tls_no_verify: bool = False
-    # Broad collection is intentionally opt-in because target authorization
-    # resolution can otherwise create substantial DC load.
     allow_all_targets: bool = False
     connect_timeout: float = 10.0
     receive_timeout: float = 30.0
@@ -172,7 +150,7 @@ def _sid(raw: bytes | str | None) -> str | None:
     if isinstance(raw, str):
         return raw
     try:
-        from impacket.ldap.ldaptypes import LDAP_SID  # type: ignore[import-not-found]
+        from impacket.ldap.ldaptypes import LDAP_SID
 
         return LDAP_SID(data=bytes(raw)).formatCanonical()
     except Exception:
@@ -196,11 +174,6 @@ def _sid_filter(sid: str) -> str:
         not 0 <= item <= 0xFFFFFFFF for item in subauthorities
     ):
         raise ValueError(f"invalid SID {sid!r}")
-    # Active Directory accepts the canonical SID syntax for objectSid equality
-    # filters. Windows Server 2025 returned no rows for an RFC 4515 byte-escaped
-    # binary SID through ldap3, including when ldap3's own escape_bytes helper
-    # produced the identical filter. Return the already strictly numeric,
-    # injection-safe canonical representation that works across the live path.
     return normalized
 
 
@@ -240,9 +213,6 @@ def _trustee_object_kind(object_classes: Any) -> str:
 
 
 def _token_sids(entry: dict[str, Any]) -> tuple[str, ...]:
-    # SELF (S-1-5-10) is deliberately NOT added: in an AD access check the DC
-    # substitutes a SELF ACE with the SID of the object being evaluated, so it
-    # is not a universal token membership of an arbitrary principal.
     values = [EVERYONE, AUTHENTICATED_USERS]
     values.extend(filter(None, (_sid(value) for value in _raw(entry, "objectSid"))))
     values.extend(filter(None, (_sid(value) for value in _raw(entry, "sIDHistory"))))
@@ -309,7 +279,7 @@ class LDAPCollector:
 
     def _connect(self):
         try:
-            from ldap3 import (  # type: ignore[import-not-found]
+            from ldap3 import (
                 KERBEROS,
                 ENCRYPT,
                 NONE,
@@ -321,7 +291,7 @@ class LDAPCollector:
                 Tls,
                 TLS_CHANNEL_BINDING,
             )
-        except ImportError as exc:  # pragma: no cover - depends on optional extra
+        except ImportError as exc:
             raise RuntimeError(
                 "live collection requires the 'collect' extra (ldap3 and impacket)"
             ) from exc
@@ -368,10 +338,6 @@ class LDAPCollector:
             connect_timeout=self.config.connect_timeout,
         )
         auth = self.config.auth
-        # ldap3 2.10.2rc4 passes receive_timeout to struct.pack("LL", ...)
-        # on POSIX. Supplying the float accepted by our CLI therefore crashes
-        # before bind. Round fractional seconds up while always passing the
-        # integer that ldap3's socket adapter requires.
         ldap_receive_timeout = max(1, ceil(self.config.receive_timeout))
         if auth.kerberos:
             user = auth.username
@@ -471,11 +437,11 @@ class LDAPCollector:
         scope: str = "SUBTREE",
         security_descriptor: bool = False,
     ) -> list[dict[str, Any]]:
-        from ldap3 import BASE, SUBTREE  # type: ignore[import-not-found]
+        from ldap3 import BASE, SUBTREE
 
         controls = None
         if security_descriptor:
-            from ldap3.protocol.microsoft import security_descriptor_control  # type: ignore[import-not-found]
+            from ldap3.protocol.microsoft import security_descriptor_control
 
             controls = security_descriptor_control(sdflags=_SD_FLAGS_OWNER_DACL)
         for attempt in range(self.config.retry_limit + 1):
@@ -564,9 +530,6 @@ class LDAPCollector:
 
     @staticmethod
     def _descriptor(entry: dict[str, Any]):
-        # GPOWake evaluates domainDNS, OU, site and groupPolicyContainer
-        # objects here, not computer-derived objects. BlockOwnerImplicitRights
-        # therefore does not suppress owner rights for these descriptors.
         return parse_security_descriptor(
             _first(_raw(entry, "nTSecurityDescriptor")),
             owner_implicit_rights_verified=True,
@@ -713,7 +676,7 @@ class LDAPCollector:
         return token_entry[0] if token_entry else entry
 
     def _collect_principals(self, base_dn: str) -> list[Principal]:
-        from ldap3.utils.conv import escape_filter_chars  # type: ignore[import-not-found]
+        from ldap3.utils.conv import escape_filter_chars
 
         principals: list[Principal] = []
         for requested in self.config.principals:
@@ -784,7 +747,7 @@ class LDAPCollector:
 
         if not selection:
             return base_filter
-        from ldap3.utils.conv import escape_filter_chars  # type: ignore[import-not-found]
+        from ldap3.utils.conv import escape_filter_chars
 
         clauses: list[str] = []
         for requested in selection:
@@ -1048,11 +1011,6 @@ class LDAPCollector:
 
         if not relevant_sids:
             return {}, set(), set()
-        # Well-known pseudo-principals have no directory object to look up; an
-        # LDAP query for them always returns nothing, which would otherwise
-        # mark them permanently unresolved. Pre-resolve them with no group
-        # membership contribution (Enterprise Domain Controllers membership is
-        # instead attributed per-target from userAccountControl).
         resolved_objects: set[str] = set(relevant_sids) & WELL_KNOWN_NO_OBJECT_SIDS
         sid_list = sorted(relevant_sids - resolved_objects)
         groups: dict[str, str] = {}
@@ -1082,10 +1040,6 @@ class LDAPCollector:
                         resolved_objects.add(normalized)
                         groups[normalized] = entry["dn"]
                     elif object_kind == "non-group":
-                        # Local non-group trustees cannot be transitive group
-                        # memberships of a selected computer. Foreign security
-                        # principals are intentionally left unresolved because
-                        # their remote object type/token expansion is unknown.
                         resolved_objects.add(normalized)
 
         memberships: dict[str, set[str]] = {}
